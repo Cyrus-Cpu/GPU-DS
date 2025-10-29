@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 AI 算牌預測 v3.8.4 - GPU-DS-V2.1.1（高推薦率優化版）錯誤修復
@@ -662,7 +661,7 @@ class ComprehensiveMemoryManager:
             return
         
         current_stats = self.get_memory_stats()
-        gpu_memory_usage = current_stats.get('gpu_memory_allocated', 0) + current_stats.get('g
+        gpu_memory_usage = current_stats.get('gpu_memory_allocated', 0) + current_stats.get('gpu_memory_cached', 0)
                                                                                             
 def optimize_memory_usage(self, model, data_loader):
         """优化内存使用"""
