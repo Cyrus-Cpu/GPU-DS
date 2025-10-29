@@ -1736,7 +1736,7 @@ class PredictionSystemGUI:
             self.train_text.see(tk.END)
             
             # 更新预测日志（如果包含预测相关消息）
-            if any(keyword in message.lower() for keyword in ['预测', 'r
+            if any(keyword in message.lower() for keyword in ['预测', '实际', '误差', 'mae', 'rmse']):
                                                               
           # 更新预测日志（如果包含预测相关消息）
             if any(keyword in message.lower() for keyword in ['预测', '实际', '误差', 'mae', 'rmse']):
