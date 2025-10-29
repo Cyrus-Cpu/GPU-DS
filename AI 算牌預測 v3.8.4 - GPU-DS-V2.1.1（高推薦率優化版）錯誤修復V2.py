@@ -6,7 +6,7 @@ GPU加速深度学习预测系统 - 完整版本
 作者：完整修复版本
 日期：2025-10-29
 """
-
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -199,12 +199,12 @@ class AdvancedLSTMWithAttention(nn.Module):
         
         self._initialize_weights()
         
-    def _initialize_weights(self):
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.constant_(param, 0.0)
+def _initialize_weights(self):
+    for name, param in self.named_parameters():
+        if 'weight' in name and param.dim() > 1:  # 只对维度大于1的权重进行初始化
+            nn.init.xavier_uniform_(param)
+        elif 'bias' in name:
+            nn.init.constant_(param, 0.0)
                 
     def forward(self, x):
         batch_size, seq_len, _ = x.size()
@@ -1256,16 +1256,16 @@ class PredictionSystemGUI:
             except Exception as e:
                 self.log_status(f"训练失败: {e}")
 
-        def display_training_results(self, history):
-        """显示训练结果"""
-        self.log_status("\n=== 训练结果 ===")
-        self.log_status(f"最终训练损失: {history['train_loss'][-1]:.6f}")
-        self.log_status(f"最终验证损失: {history['val_loss'][-1]:.6f}")
-        self.log_status(f"最佳验证损失: {min(history['val_loss']):.6f}")
-        self.log_status(f"总训练时间: {sum(history['epoch_time']):.2f}秒")
-        
-        # 绘制训练曲线
-        self.plot_training_curves(history)
+def display_training_results(self, history):
+    """显示训练结果"""
+    self.log_status("\n=== 训练结果 ===")
+    self.log_status(f"最终训练损失: {history['train_loss'][-1]:.6f}")
+    self.log_status(f"最终验证损失: {history['val_loss'][-1]:.6f}")
+    self.log_status(f"最佳验证损失: {min(history['val_loss']):.6f}")
+    self.log_status(f"总训练时间: {sum(history['epoch_time']):.2f}秒")
+    
+    # 绘制训练曲线
+    self.plot_training_curves(history)
     
     def plot_training_curves(self, history):
         """绘制训练曲线"""
@@ -1725,18 +1725,18 @@ class PredictionSystemGUI:
             except Exception as e:
                 self.log_status(f"导出失败: {e}")
     
-    def log_status(self, message):
-        """记录状态信息"""
-        def _log():
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            log_message = f"[{timestamp}] {message}\n"
-            
-            # 更新训练日志
-            self.train_text.insert(tk.END, log_message)
-            self.train_text.see(tk.END)
-            
-            # 更新预测日志（如果包含预测相关消息）
-            if any(keyword in message.lower() for keyword in ['预测', '实际', '误差', 'mae', 'rmse']):
+def log_status(self, message):
+    """记录状态信息"""
+    def _log():
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        
+        # 更新训练日志
+        self.train_text.insert(tk.END, log_message)
+        self.train_text.see(tk.END)
+        
+        # 更新预测日志（如果包含预测相关消息）
+        if any(keyword in message.lower() for keyword in ['预测', '实际', '误差', 'mae', 'rmse']):
                                                               
           # 更新预测日志（如果包含预测相关消息）
             if any(keyword in message.lower() for keyword in ['预测', '实际', '误差', 'mae', 'rmse']):
