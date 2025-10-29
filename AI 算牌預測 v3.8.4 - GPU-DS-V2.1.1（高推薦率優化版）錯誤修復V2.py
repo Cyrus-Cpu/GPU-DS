@@ -1254,7 +1254,7 @@ class PredictionSystemGUI:
                 self.display_training_results(history)
                 
             except Exception as e:
-                self.log_status(f"训练失败:
+                self.log_status(f"训练失败: {e}")
 
         def display_training_results(self, history):
         """显示训练结果"""
