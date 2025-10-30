@@ -1,0 +1,2789 @@
+# 百家樂 AI 算牌預測 v3.8.4 - GPU-DP-V2.1（趨勢優化修復版）
+# 完整恢復v3.8.4界面 + GPU趨勢累積修復 + 精準反向邏輯
+# 修改日期：2024年
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import random
+from collections import defaultdict
+import math
+import csv
+import os
+from datetime import datetime
+import threading
+import time
+
+# 嘗試導入 GPU 相關庫
+try:
+    import cupy as cp
+    import numpy as np
+    from numba import cuda
+    GPU_AVAILABLE = True
+    print("✓ GPU加速可用 - CuPy已載入")
+except ImportError as e:
+    print(f"✗ GPU加速不可用: {e}")
+    GPU_AVAILABLE = False
+
+# 嘗試導入 matplotlib
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    
+    # === 簡單修復：添加中文字體設置 ===
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    # =================================
+    
+    MATPLOTLIB_AVAILABLE = True
+    print("✓ matplotlib 可用 - 中文字體已設置")
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("✗ matplotlib 不可用")
+
+# 精準反向邏輯系統 - 多維度反向信號檢測
+def should_reverse_bet(bet_type, current_prob, percentage_change, acceleration, trend_state, threshold):
+    """多維度判斷是否應該反向下注"""
+    
+    # 信號1: 概率過高但趨勢衰減
+    if current_prob > 48.0 and acceleration < -0.1:
+        return True
+    
+    # 信號2: 變化率與趨勢強度背離
+    if (percentage_change > 1.0 and trend_state['trend_strength'][bet_type] < -0.5):
+        return True
+    
+    # 信號3: 連續同向變化後的轉折點
+    change_history = trend_state['change_history'][bet_type]
+    if len(change_history) >= 3:
+        # 如果連續3次同向變化，可能出現反轉
+        if all(c > 0 for c in change_history[-3:]) and acceleration < -0.2:
+            return True
+        if all(c < 0 for c in change_history[-3:]) and acceleration > 0.2:
+            return True
+    
+    # 信號4: 極端概率值的均值回歸
+    if current_prob > 49.5 or current_prob < 42.0:
+        return True
+    
+    # 信號5: 累積變化過度後的修正
+    if abs(trend_state['cumulative_changes'][bet_type]) > 3.0:
+        return True
+    
+    return False
+
+# 反向邏輯分級系統
+def get_reverse_bet_level(bet_type, current_prob, percentage_change, acceleration, trend_state):
+    """根據反向信號強度確定下注等級"""
+    
+    reverse_signals = 0
+    signal_strength = 0
+    
+    # 信號強度計算
+    if current_prob > 48.5:
+        reverse_signals += 1
+        signal_strength += (current_prob - 48.5) * 2
+    
+    if acceleration < -0.15:
+        reverse_signals += 1
+        signal_strength += abs(acceleration) * 10
+    
+    if abs(trend_state['cumulative_changes'][bet_type]) > 2.5:
+        reverse_signals += 1
+        signal_strength += abs(trend_state['cumulative_changes'][bet_type]) * 0.5
+    
+    # 趨勢背離檢測
+    if (percentage_change > 0 and trend_state['trend_strength'][bet_type] < -1.0) or \
+       (percentage_change < 0 and trend_state['trend_strength'][bet_type] > 1.0):
+        reverse_signals += 2
+        signal_strength += 2.0
+    
+    # 確定反向下注等級
+    if reverse_signals >= 3 and signal_strength > 3.0:
+        return 3  # 強烈反向信號
+    elif reverse_signals >= 2 and signal_strength > 1.5:
+        return 2  # 中等反向信號
+    elif reverse_signals >= 1 and signal_strength > 0.5:
+        return 1  # 弱反向信號
+    else:
+        return 0  # 無反向信號
+
+# 改進的閾值字典 - 專注反向邏輯
+reverse_thresholds_dict = {
+    "banker": {
+        # 莊家過度樂觀 -> 反向下注閒家
+        "reverse_1": {
+            "min_prob": 48.0, "max_prob": 52.0,  # 概率過高
+            "min_change": 0.5, "max_change": 100.0,  # 有明顯變化
+            "min_accel": -0.3, "max_accel": 0.0,  # 加速為負（衰減）
+            "min_trend_strength": -2.0,  # 趨勢強度為負
+            "min_cumulative": 2.0,  # 累積變化過度
+            "level": 2, "win_rate": 52.5
+        },
+        "reverse_2": {
+            "min_prob": 47.0, "max_prob": 49.0,
+            "min_change": 1.0, "max_change": 100.0,
+            "min_accel": -0.2, "max_accel": 0.0,
+            "min_trend_strength": -1.0,
+            "min_cumulative": 1.5,
+            "level": 1, "win_rate": 51.0
+        }
+    },
+    "player": {
+        # 閒家過度樂觀 -> 反向下注莊家
+        "reverse_1": {
+            "min_prob": 46.0, "max_prob": 50.0,
+            "min_change": 0.5, "max_change": 100.0,
+            "min_accel": -0.3, "max_accel": 0.0,
+            "min_trend_strength": -2.0,
+            "min_cumulative": 2.0,
+            "level": 2, "win_rate": 53.0
+        },
+        "reverse_2": {
+            "min_prob": 45.0, "max_prob": 47.0,
+            "min_change": 1.0, "max_change": 100.0,
+            "min_accel": -0.2, "max_accel": 0.0,
+            "min_trend_strength": -1.0,
+            "min_cumulative": 1.5,
+            "level": 1, "win_rate": 51.5
+        }
+    }
+}
+
+# 時間序列模式識別
+def detect_reversal_pattern(change_history, current_change, acceleration):
+    """檢測價格反轉模式"""
+    if len(change_history) < 4:
+        return False
+    
+    recent_changes = change_history[-4:] + [current_change]
+    
+    # 模式1: 連續上漲後的下跌
+    if (all(c > 0 for c in recent_changes[:-2]) and 
+        recent_changes[-2] < 0 and recent_changes[-1] < 0 and
+        acceleration < -0.1):
+        return True
+    
+    # 模式2: 連續下跌後的上漲
+    if (all(c < 0 for c in recent_changes[:-2]) and 
+        recent_changes[-2] > 0 and recent_changes[-1] > 0 and
+        acceleration > 0.1):
+        return True
+    
+    # 模式3: 高點背離（價格新高但動能衰減）
+    if (max(recent_changes[:-1]) > 1.0 and 
+        current_change < max(recent_changes[:-1]) * 0.5 and
+        acceleration < -0.15):
+        return True
+    
+    return False
+
+# 完整的改進反向邏輯實現
+def improved_reverse_evaluation(bet_type, current_prob, percentage_change, acceleration, trend_state, threshold):
+    """改進的反向下注評估"""
+    
+    # 基礎條件檢查
+    if current_prob < threshold.get("min_prob", 0) or current_prob > threshold.get("max_prob", 100):
+        return None, 0
+    
+    if not (threshold["min_change"] <= abs(percentage_change) < threshold["max_change"]):
+        return None, 0
+    
+    if not (threshold["min_accel"] <= acceleration <= threshold.get("max_accel", 100)):
+        return None, 0
+    
+    # 多維度反向信號檢測
+    reverse_signals = []
+    
+    # 信號1: 趨勢強度背離
+    if trend_state['trend_strength'][bet_type] < threshold.get("min_trend_strength", 0):
+        reverse_signals.append(1)
+    
+    # 信號2: 累積變化過度
+    if abs(trend_state['cumulative_changes'][bet_type]) > threshold.get("min_cumulative", 0):
+        reverse_signals.append(1)
+    
+    # 信號3: 概率極值
+    if current_prob > 48.5 or current_prob < 42.0:
+        reverse_signals.append(1)
+    
+    # 信號4: 時間序列反轉模式
+    if detect_reversal_pattern(trend_state['change_history'][bet_type], percentage_change, acceleration):
+        reverse_signals.append(2)  # 更強的信號
+    
+    # 確定反向下注
+    if len(reverse_signals) >= 2 and sum(reverse_signals) >= 2:
+        final_bet_type = 'player' if bet_type == 'banker' else 'banker'
+        
+        # 根據信號強度確定下注等級
+        signal_strength = sum(reverse_signals)
+        if signal_strength >= 4:
+            reverse_level = min(5, threshold["level"] + 2)
+        elif signal_strength >= 3:
+            reverse_level = min(3, threshold["level"] + 1)
+        else:
+            reverse_level = threshold["level"]
+        
+        return final_bet_type, reverse_level
+    
+    return None, 0
+
+# 根據GPU模擬結果0.3快速分析設定的新閾值
+thresholds_dict = {
+    "banker": {
+        # 正向指標 - 莊家（勝率≥49%）
+        "1": {"min_change": 0.0, "max_change": 0.5, "min_accel": 0.0, "min_prob": 46.0, "level": 2, "win_rate": 50.3},
+        "2": {"min_change": 0.5, "max_change": 1.0, "min_accel": 0.1, "min_prob": 46.5, "level": 3, "win_rate": 50.2},
+        "3": {"min_change": 1.0, "max_change": 1.5, "min_accel": 0.2, "min_prob": 47.0, "level": 4, "win_rate": 50.3},
+        "4": {"min_change": 1.5, "max_change": 2.0, "min_accel": 0.3, "min_prob": 47.5, "level": 5, "win_rate": 50.4},
+        "5": {"min_change": 2.0, "max_change": 100.0, "min_accel": 0.4, "min_prob": 48.0, "level": 10, "win_rate": 50.3},
+        # 反向指標 - 莊家（勝率<49%）
+        "6": {"min_change": 0.0, "max_change": 0.5, "min_accel": 0.0, "min_prob": 45.0, "reverse": True, "level": 1, "win_rate": 48.5},
+        "7": {"min_change": 0.5, "max_change": 1.0, "min_accel": 0.1, "min_prob": 45.5, "reverse": True, "level": 1, "win_rate": 48.0}
+    },
+    "player": {
+        # 正向指標 - 閒家（勝率≥49%）
+        "1": {"min_change": 1.0, "max_change": 100.0, "min_accel": 0.1, "min_prob": 44.0, "level": 5, "win_rate": 52.0},
+        "2": {"min_change": 1.0, "max_change": 100.0, "min_accel": 0.1, "min_prob": 44.5, "level": 10, "win_rate": 52.0},
+        # 反向指標 - 閒家（勝率<49%）
+        "3": {"min_change": 0.0, "max_change": 0.5, "min_accel": 0.0, "min_prob": 44.0, "reverse": True, "level": 1, "win_rate": 49.5},
+        "4": {"min_change": 0.5, "max_change": 1.0, "min_accel": 0.1, "min_prob": 44.5, "reverse": True, "level": 1, "win_rate": 49.6},
+        "5": {"min_change": 0.0, "max_change": 100.0, "min_accel": 0.0, "min_prob": 45.5, "reverse": True, "level": 1, "win_rate": 43.3},
+        "6": {"min_change": 0.0, "max_change": 100.0, "min_accel": 0.0, "min_prob": 46.0, "reverse": True, "level": 1, "win_rate": 40.0}
+    },
+    "tie": {
+        "1": {"min_change": 100.0, "max_change": 0.0, "min_accel": 100.0, "min_prob": 0.0, "level": 0, "win_rate": 0.0},
+        "2": {"min_change": 100.0, "max_change": 0.0, "min_accel": 100.0, "min_prob": 0.0, "level": 0, "win_rate": 0.0},
+        "3": {"min_change": 100.0, "max_change": 0.0, "min_accel": 100.0, "min_prob": 0.0, "level": 0, "win_rate": 0.0},
+        "4": {"min_change": 100.0, "max_change": 0.0, "min_accel": 100.0, "min_prob": 0.0, "level": 0, "win_rate": 0.0},
+        "5": {"min_change": 100.0, "max_change": 0.0, "min_accel": 100.0, "min_prob": 0.0, "level": 0, "win_rate": 0.0}
+    }
+}
+
+card_values = {
+    'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, 
+    '6': 6, '7': 7, '8': 8, '9': 9, '10': 0, 
+    'J': 0, 'Q': 0, 'K': 0
+}
+card_names = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+
+class BaccaratGPUSimulator:
+    def __init__(self):
+        global GPU_AVAILABLE
+        if GPU_AVAILABLE:
+            try:
+                self.device = cp.cuda.Device(0)
+                self.device.use()
+                print(f"✓ GPU模擬器初始化 - v3.8.4趨勢優化系統")
+            except Exception as e:
+                print(f"✗ GPU設備初始化失敗: {e}")
+                GPU_AVAILABLE = False
+        else:
+            print("✗ GPU不可用，使用CPU模擬")
+        
+        # 與主程式完全相同的配置
+        self.base_probabilities = {
+            'banker': 45.851, 'player': 44.695, 'tie': 9.454
+        }
+        self.card_values = card_values
+        self.decks = 10
+        self.card_names = card_names
+        
+        # 趨勢系統狀態（與主程式完全同步）
+        self._reset_trend_state()
+        
+        # 調試統計
+        self.debug_stats = {
+            'total_recommendations': 0,
+            'banker_recommendations': 0,
+            'player_recommendations': 0,
+            'no_recommendations': 0,
+            'reverse_recommendations': 0
+        }
+
+    def _reset_trend_state(self):
+        """重置趨勢狀態（與主程式相同）"""
+        self.trend_state = {
+            'previous_changes': {'banker': 0.0, 'player': 0.0, 'tie': 0.0},
+            'trend_strength': {'banker': 0.0, 'player': 0.0, 'tie': 0.0},
+            'cumulative_changes': {'banker': 0.0, 'player': 0.0, 'tie': 0.0},
+            'consecutive_no_recommendation': 0,
+            'change_history': {'banker': [], 'player': [], 'tie': []},
+            'trend_decay_counter': {'banker': 0, 'player': 0, 'tie': 0}
+        }
+
+    def mass_simulation(self, num_simulations=10000):
+        """大規模模擬 - v3.8.4趨勢優化版本"""
+        start_time = time.time()
+        
+        try:
+            # 重置趨勢狀態和統計
+            self._reset_trend_state()
+            self.debug_stats = {
+                'total_recommendations': 0,
+                'banker_recommendations': 0, 
+                'player_recommendations': 0,
+                'no_recommendations': 0,
+                'reverse_recommendations': 0
+            }
+            
+            if GPU_AVAILABLE:
+                results = self._gpu_accelerated_simulation(num_simulations)
+            else:
+                results = self._cpu_fallback_simulation(num_simulations)
+            
+            end_time = time.time()
+            simulation_time = end_time - start_time
+            
+            results['performance'] = {
+                'total_time': simulation_time,
+                'games_per_second': num_simulations / simulation_time,
+                'num_simulations': num_simulations
+            }
+            
+            # 輸出調試統計
+            total_games = num_simulations
+            rec_rate = (self.debug_stats['total_recommendations'] / total_games) * 100
+            reverse_rate = (self.debug_stats['reverse_recommendations'] / total_games) * 100
+            print(f"✓ v3.8.4模擬完成: {num_simulations}局")
+            print(f"📊 推薦統計: 莊{self.debug_stats['banker_recommendations']} 閒{self.debug_stats['player_recommendations']} 無{self.debug_stats['no_recommendations']}")
+            print(f"🔄 反向推薦: {self.debug_stats['reverse_recommendations']}局 ({reverse_rate:.1f}%)")
+            print(f"📈 推薦率: {rec_rate:.1f}%")
+            
+            return results
+            
+        except Exception as e:
+            print(f"✗ 模擬錯誤: {e}")
+            return self._cpu_fallback_simulation(num_simulations)
+
+    def _gpu_accelerated_simulation(self, num_simulations):
+        """GPU加速模擬 - v3.8.4趨勢優化修復版"""
+        try:
+            # 使用更小的批次確保趨勢連續性
+            batch_size = min(500, num_simulations)
+            results = {
+                'banker_wins': 0,
+                'player_wins': 0,
+                'ties': 0,
+                'banker_win_rate': 0.0,
+                'player_win_rate': 0.0,
+                'tie_rate': 0.0,
+                'performance': {},
+                'detailed_results': []
+            }
+            
+            # 初始化牌堆和趨勢狀態
+            current_deck = self.initialize_deck_gpu()
+            random.shuffle(current_deck)
+            
+            # 修復：直接引用主趨勢狀態，不再複製
+            trend_state = self.trend_state
+            
+            completed_games = 0
+            batch_count = 0
+            
+            while completed_games < num_simulations:
+                batch_count += 1
+                current_batch_size = min(batch_size, num_simulations - completed_games)
+                
+                batch_results = self._simulate_batch(current_batch_size, current_deck, trend_state)
+                current_deck = batch_results['remaining_deck']
+                
+                # 修復：趨勢狀態已在批次中直接更新，無需重新賦值
+                # trend_state = batch_results['final_trend_state']
+                
+                results['banker_wins'] += batch_results['banker_wins']
+                results['player_wins'] += batch_results['player_wins']
+                results['ties'] += batch_results['ties']
+                results['detailed_results'].extend(batch_results['detailed_results'])
+                
+                completed_games += current_batch_size
+                
+                # 進度輸出
+                if batch_count % 10 == 0:
+                    progress = (completed_games / num_simulations) * 100
+                    print(f"🔄 GPU模擬進度: {completed_games}/{num_simulations} ({progress:.1f}%)")
+                
+                # 釋放GPU內存
+                if GPU_AVAILABLE:
+                    cp.get_default_memory_pool().free_all_blocks()
+            
+            total_games = num_simulations
+            results['banker_win_rate'] = results['banker_wins'] / total_games * 100
+            results['player_win_rate'] = results['player_wins'] / total_games * 100
+            results['tie_rate'] = results['ties'] / total_games * 100
+            
+            return results
+            
+        except Exception as e:
+            print(f"✗ GPU模擬錯誤: {e}")
+            raise
+
+    def _simulate_batch(self, batch_size, current_deck, trend_state):
+        """批次模擬 - 返回最終趨勢狀態"""
+        banker_wins = 0
+        player_wins = 0
+        ties = 0
+        detailed_results = []
+        
+        for i in range(batch_size):
+            result = self._simulate_single_game_cpu(i, current_deck, trend_state)
+            current_deck = result['remaining_deck']
+            # trend_state 在 _simulate_single_game_cpu 中已經被更新
+            
+            if result['winner'] == 'banker':
+                banker_wins += 1
+            elif result['winner'] == 'player':
+                player_wins += 1
+            else:
+                ties += 1
+            
+            detailed_results.append(result)
+            
+            # 更新調試統計
+            if result['recommendation']:
+                self.debug_stats['total_recommendations'] += 1
+                if result['recommendation'] == 'banker':
+                    self.debug_stats['banker_recommendations'] += 1
+                else:
+                    self.debug_stats['player_recommendations'] += 1
+                
+                # 檢查是否為反向推薦
+                if result.get('is_reverse', False):
+                    self.debug_stats['reverse_recommendations'] += 1
+            else:
+                self.debug_stats['no_recommendations'] += 1
+        
+        return {
+            'banker_wins': banker_wins,
+            'player_wins': player_wins,
+            'ties': ties,
+            'detailed_results': detailed_results,
+            'remaining_deck': current_deck,
+            'final_trend_state': trend_state  # 返回最終趨勢狀態
+        }
+
+    def _simulate_single_game_cpu(self, game_id, remaining_deck, trend_state):
+        """單局模擬 - 完全複製CPU邏輯"""
+        # 牌堆管理（與CPU相同）
+        if remaining_deck is None or len(remaining_deck) < 6:
+            deck = self.initialize_deck_gpu()
+            random.shuffle(deck)
+        else:
+            deck = remaining_deck.copy()
+        
+        # 模擬牌局（與CPU完全相同）
+        player_hand = [deck.pop(0), deck.pop(0)]
+        banker_hand = [deck.pop(0), deck.pop(0)]
+        
+        player_score = sum(self.card_values[card] for card in player_hand) % 10
+        banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        
+        player_drew = False
+        player_third_card_value = None
+        
+        # 玩家抽牌規則（與主程式相同）
+        if player_score <= 5:
+            if len(deck) > 0:
+                player_third_card = deck.pop(0)
+                player_hand.append(player_third_card)
+                player_score = sum(self.card_values[card] for card in player_hand) % 10
+                player_drew = True
+                player_third_card_value = self.card_values[player_third_card]
+        
+        # 莊家抽牌規則（與主程式相同）
+        if banker_score <= 2:
+            if len(deck) > 0:
+                banker_third_card = deck.pop(0)
+                banker_hand.append(banker_third_card)
+                banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        elif banker_score == 3 and player_drew and player_third_card_value != 8:
+            if len(deck) > 0:
+                banker_third_card = deck.pop(0)
+                banker_hand.append(banker_third_card)
+                banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        elif banker_score == 4 and player_drew and player_third_card_value in [2,3,4,5,6,7]:
+            if len(deck) > 0:
+                banker_third_card = deck.pop(0)
+                banker_hand.append(banker_third_card)
+                banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        elif banker_score == 5 and player_drew and player_third_card_value in [4,5,6,7]:
+            if len(deck) > 0:
+                banker_third_card = deck.pop(0)
+                banker_hand.append(banker_third_card)
+                banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        elif banker_score == 6 and player_drew and player_third_card_value in [6,7]:
+            if len(deck) > 0:
+                banker_third_card = deck.pop(0)
+                banker_hand.append(banker_third_card)
+                banker_score = sum(self.card_values[card] for card in banker_hand) % 10
+        
+        # 計算勝負
+        if banker_score > player_score:
+            winner = 'banker'
+            winner_chinese = '莊'
+        elif player_score > banker_score:
+            winner = 'player'
+            winner_chinese = '閒'
+        else:
+            winner = 'tie'
+            winner_chinese = '和'
+        
+        # 計算真實概率（與CPU相同）
+        probabilities = self._calculate_probabilities_from_deck(deck)
+        
+        # 使用完全相同的推薦邏輯（包含精準反向邏輯）
+        recommendation, bet_level, is_reverse = self._get_recommendation_with_main_logic(
+            probabilities, 
+            trend_state
+        )
+        
+        # 更新趨勢狀態（與CPU相同）
+        self._update_trend_state(trend_state, probabilities, recommendation)
+        
+        # 生成結果
+        result_text = self._generate_result_text(recommendation, winner, winner_chinese, is_reverse)
+        
+        return {
+            'game_id': game_id,
+            'banker_hand': banker_hand,
+            'player_hand': player_hand,
+            'banker_score': banker_score,
+            'player_score': player_score,
+            'winner': winner,
+            'winner_chinese': winner_chinese,
+            'probabilities': probabilities,
+            'recommendation': recommendation,
+            'bet_level': bet_level,
+            'is_reverse': is_reverse,
+            'result_text': result_text,
+            'result': '✓' if recommendation == winner else '✗' if recommendation else '無',
+            'remaining_deck': deck,
+            'changes': self._calculate_changes(probabilities),
+            'trend_state': trend_state
+        }
+
+    def _calculate_probabilities_from_deck(self, deck):
+        """計算基於剩餘牌堆的真實概率（與主程式完全一致）"""
+        total_cards = len(deck)
+        total_initial_cards = self.decks * 52
+        
+        if total_cards < 20:  # 與主程式相同的重新洗牌條件
+            return self.base_probabilities.copy()
+        
+        # 計算各點數牌的數量（與主程式相同）
+        card_counts = {}
+        for card in self.card_names:
+            count = deck.count(card)
+            card_counts[card] = count
+        
+        point_ratios = {}
+        for point in range(0, 10):
+            if point == 0:
+                cards_for_point = ['10', 'J', 'Q', 'K']
+            else:
+                cards_for_point = [card for card in self.card_names if self.card_values[card] == point]
+            
+            total_count = sum(card_counts[card] for card in cards_for_point)
+            point_ratios[point] = total_count / total_cards
+        
+        # 與主程式完全相同的調整公式
+        high_card_ratio = point_ratios[0]
+        low_card_ratio = sum(point_ratios[i] for i in [1, 2, 3, 4, 5])
+        medium_card_ratio = sum(point_ratios[i] for i in [6, 7])
+        eight_nine_ratio = sum(point_ratios[i] for i in [8, 9])
+        
+        banker_adjust = (eight_nine_ratio - 0.158) * 8 - (low_card_ratio - 0.385) * 4
+        player_adjust = (low_card_ratio - 0.385) * 8 - (eight_nine_ratio - 0.158) * 4
+        tie_adjust = (medium_card_ratio - 0.308) * 6
+        
+        # 消耗效應（與主程式相同）
+        consumption_ratio = (total_initial_cards - total_cards) / total_initial_cards
+        consumption_effect = consumption_ratio * 2
+        
+        # 與主程式相同的概率計算
+        probabilities = {
+            'banker': max(40.0, min(52.0, self.base_probabilities['banker'] + banker_adjust + consumption_effect)),
+            'player': max(40.0, min(52.0, self.base_probabilities['player'] + player_adjust - consumption_effect)),
+            'tie': max(5.0, min(15.0, self.base_probabilities['tie'] + tie_adjust))
+        }
+        
+        # 正規化（與主程式相同）
+        total = sum(probabilities.values())
+        if total > 0:
+            scale = 100.0 / total
+            for key in probabilities:
+                probabilities[key] = round(probabilities[key] * scale, 3)
+        
+        return probabilities
+
+    def _get_recommendation_with_main_logic(self, probabilities, trend_state):
+        """完全複製主程式的推薦邏輯（包含精準反向邏輯）"""
+        banker_prob = probabilities['banker']
+        player_prob = probabilities['player']
+        
+        # 計算變化率（與主程式完全相同）
+        base_probs = self.base_probabilities
+        banker_change = ((banker_prob - base_probs['banker']) / base_probs['banker']) * 100
+        player_change = ((player_prob - base_probs['player']) / base_probs['player']) * 100
+        
+        # 計算加速（與主程式完全相同）
+        previous_changes = trend_state['previous_changes']
+        banker_acceleration = banker_change - previous_changes['banker']
+        player_acceleration = player_change - previous_changes['player']
+        
+        # 莊家推薦判斷（完全複製主程式邏輯 + 精準反向邏輯）
+        banker_recommendation = self._evaluate_bet_recommendation(
+            'banker', banker_prob, banker_change, banker_acceleration, trend_state
+        )
+        
+        # 閒家推薦判斷（完全複製主程式邏輯 + 精準反向邏輯）
+        player_recommendation = self._evaluate_bet_recommendation(
+            'player', player_prob, player_change, player_acceleration, trend_state
+        )
+        
+        # 選擇最佳推薦（與主程式相同）
+        recommendations = []
+        if banker_recommendation and banker_recommendation['level'] > 0:
+            recommendations.append(banker_recommendation)
+        if player_recommendation and player_recommendation['level'] > 0:
+            recommendations.append(player_recommendation)
+        
+        if recommendations:
+            recommendations.sort(key=lambda x: (x['level'], abs(trend_state['trend_strength'][x['bet_type']])), reverse=True)
+            best_rec = recommendations[0]
+            return best_rec['bet_type'], best_rec['level'], best_rec.get('is_reverse', False)
+        else:
+            return None, 0, False
+
+    def _evaluate_bet_recommendation(self, bet_type, current_prob, percentage_change, acceleration, trend_state):
+        """評估下注推薦（完全複製主程式邏輯 + 精準反向邏輯）"""
+        if bet_type not in thresholds_dict:
+            return None
+        
+        # 動態加速閾值（與主程式相同）
+        base_threshold = 0.05  # 從0.1降低到0.05
+        consecutive_no_recommendation = trend_state['consecutive_no_recommendation']
+        
+        if consecutive_no_recommendation >= 10:  # 從8增加到10
+            current_accel_threshold = base_threshold * 0.5  # 從0.3增加到0.5
+        elif consecutive_no_recommendation >= 6:  # 從5增加到6
+            current_accel_threshold = base_threshold * 0.7  # 從0.5增加到0.7
+        elif consecutive_no_recommendation >= 3:
+            current_accel_threshold = base_threshold * 0.85  # 從0.7增加到0.85
+        else:
+            current_accel_threshold = base_threshold
+        
+        # 趨勢過濾（與主程式相同）
+        if abs(trend_state['trend_strength'][bet_type]) < 0.0001:  # 從0.1降低到0.0001
+            return None
+        
+        final_bet_type = bet_type
+        cumulative_bonus = 0
+        is_reverse = False
+        
+        if abs(trend_state['cumulative_changes'][bet_type]) > 0.5:  # 從1.0降低到0.5
+            cumulative_bonus = min(2, int(abs(trend_state['cumulative_changes'][bet_type]) * 2))  # 獎勵加倍
+        
+        # 首先檢查精準反向邏輯
+        reverse_bet, reverse_level = improved_reverse_evaluation(
+            bet_type, current_prob, percentage_change, acceleration, 
+            trend_state, reverse_thresholds_dict[bet_type].get("reverse_1", {})
+        )
+        
+        if reverse_bet and reverse_level > 0:
+            final_bet_type = reverse_bet
+            base_level = reverse_level
+            is_reverse = True
+        else:
+            # 原有閾值判斷邏輯（與主程式完全相同）
+            for level in ['7', '6', '5', '4', '3', '2', '1']:
+                if level in thresholds_dict[bet_type]:
+                    threshold = thresholds_dict[bet_type][level]
+                    
+                    if current_prob < threshold.get("min_prob", 0):
+                        continue
+                    
+                    if (threshold["min_change"] <= abs(percentage_change) < threshold["max_change"] and 
+                        acceleration >= threshold["min_accel"]):
+                        
+                        base_level = threshold["level"]
+                        
+                        if threshold.get("reverse", False) or threshold.get("win_rate", 50) < 49:
+                            final_bet_type = 'player' if bet_type == 'banker' else 'banker'
+                            base_level = 1
+                            is_reverse = True
+                        
+                        if not threshold.get("reverse", False) and threshold.get("win_rate", 50) >= 49:
+                            final_level = min(20, base_level + cumulative_bonus)
+                        else:
+                            final_level = base_level
+                        
+                        return {
+                            'bet_type': final_bet_type,
+                            'level': final_level,
+                            'is_reverse': is_reverse
+                        }
+            
+            return None
+        
+        # 反向邏輯的等級計算
+        if is_reverse:
+            reverse_level_adjusted = get_reverse_bet_level(
+                bet_type, current_prob, percentage_change, acceleration, trend_state
+            )
+            final_level = max(1, min(5, base_level + reverse_level_adjusted))
+            
+            return {
+                'bet_type': final_bet_type,
+                'level': final_level,
+                'is_reverse': is_reverse
+            }
+        
+        return None
+
+    def _update_trend_state(self, trend_state, probabilities, recommendation):
+        """更新趨勢狀態（與主程式完全相同）"""
+        # 計算變化率
+        current_changes = {}
+        for bet_type in ['banker', 'player', 'tie']:
+            current_prob = probabilities[bet_type]
+            base_prob = self.base_probabilities[bet_type]
+            current_changes[bet_type] = ((current_prob - base_prob) / base_prob) * 100
+        
+        # 更新趨勢強度（與主程式相同的複雜邏輯）
+        for bet_type in ['banker', 'player']:
+            current_change = current_changes[bet_type]
+            previous_change = trend_state['previous_changes'][bet_type]
+            acceleration = current_change - previous_change
+            
+            # 完全複製CPU的趨勢更新邏輯
+            current_strength = trend_state['trend_strength'][bet_type]
+            
+            if acceleration > 0.05:  # 加速閾值從0.1降低到0.05
+                strength_increment = max(0.05, min(2.0, abs(acceleration) * 0.5))  # 乘數從0.3增加到0.5
+                if current_strength > 8.0:  # 從5.0增加到8.0
+                    strength_increment *= 0.6  # 從0.5增加到0.6
+                elif current_strength > 5.0:  # 從3.0增加到5.0
+                    strength_increment *= 0.8  # 從0.7增加到0.8
+                trend_state['trend_strength'][bet_type] = min(15.0, current_strength + strength_increment)  # 從10.0增加到15.0
+                trend_state['trend_decay_counter'][bet_type] = 0
+            elif acceleration < -0.05:  # 加速閾值從0.1降低到0.05
+                strength_decrement = max(0.05, min(2.0, abs(acceleration) * 0.5))  # 乘數從0.3增加到0.5
+                trend_state['trend_strength'][bet_type] = max(-15.0, current_strength - strength_decrement)  # 從10.0增加到15.0
+                trend_state['trend_decay_counter'][bet_type] = 0
+            else:
+                trend_state['trend_decay_counter'][bet_type] += 1
+                
+                # 衰減邏輯（與CPU相同）
+                decay_rate = 0.03  # 從0.05降低到0.03
+                if abs(current_strength) > 10.0:  # 從8.0增加到10.0
+                    decay_rate = 0.12  # 從0.15降低到0.12
+                elif abs(current_strength) > 6.0:  # 從5.0增加到6.0
+                    decay_rate = 0.08  # 從0.10降低到0.08
+                elif abs(current_strength) > 3.0:
+                    decay_rate = 0.05  # 從0.07降低到0.05
+                    
+                decay_multiplier = min(2.5, 1.0 + (trend_state['trend_decay_counter'][bet_type] * 0.08))  # 乘數從0.1降低到0.08
+                decay_rate *= decay_multiplier
+                
+                if current_strength > 0:
+                    trend_state['trend_strength'][bet_type] = max(0, current_strength - decay_rate)
+                elif current_strength < 0:
+                    trend_state['trend_strength'][bet_type] = min(0, current_strength + decay_rate)
+            
+            # 累積變化（與CPU相同）
+            cumulative_effect = current_change * 0.03  # 從0.02增加到0.03
+            trend_state['cumulative_changes'][bet_type] += cumulative_effect
+            trend_state['cumulative_changes'][bet_type] = max(-8.0, min(8.0, trend_state['cumulative_changes'][bet_type]))  # 從5.0增加到8.0
+            
+            # 更新變化歷史
+            trend_state['change_history'][bet_type].append(current_change)
+            if len(trend_state['change_history'][bet_type]) > 5:
+                trend_state['change_history'][bet_type].pop(0)
+        
+        # 更新連續無推薦計數
+        if recommendation is None:
+            trend_state['consecutive_no_recommendation'] += 1
+        else:
+            trend_state['consecutive_no_recommendation'] = 0
+        
+        # 更新先前變化
+        trend_state['previous_changes'] = current_changes
+
+    def _generate_result_text(self, recommendation, winner, winner_chinese, is_reverse=False):
+        """生成結果文本"""
+        if recommendation:
+            chinese_name = '莊' if recommendation == 'banker' else '閒'
+            result = '✓' if recommendation == winner else '✗'
+            reverse_indicator = "🔄" if is_reverse else ""
+            return f"，推薦{reverse_indicator}({chinese_name})，{winner_chinese}贏 {result}"
+        else:
+            return "，無推薦"
+
+    def _calculate_changes(self, probabilities):
+        """計算變化率（與主程式相同）"""
+        changes = {}
+        for key in probabilities:
+            changes[key] = ((probabilities[key] - self.base_probabilities[key]) / self.base_probabilities[key]) * 100
+        return changes
+
+    def _cpu_fallback_simulation(self, num_simulations):
+        """CPU回退模擬"""
+        print("使用CPU進行模擬...")
+        start_time = time.time()
+        
+        results = {
+            'banker_wins': 0,
+            'player_wins': 0,
+            'ties': 0,
+            'detailed_results': []
+        }
+        
+        # 使用統一的牌堆管理和趨勢狀態
+        current_deck = self.initialize_deck_gpu()
+        random.shuffle(current_deck)
+        current_trend_state = self.trend_state
+        
+        for i in range(num_simulations):
+            result = self._simulate_single_game_cpu(i, current_deck, current_trend_state)
+            current_deck = result['remaining_deck']
+            
+            if result['winner'] == 'banker':
+                results['banker_wins'] += 1
+            elif result['winner'] == 'player':
+                results['player_wins'] += 1
+            else:
+                results['ties'] += 1
+            
+            results['detailed_results'].append(result)
+        
+        total_games = num_simulations
+        results['banker_win_rate'] = results['banker_wins'] / total_games * 100
+        results['player_win_rate'] = results['player_wins'] / total_games * 100
+        results['tie_rate'] = results['ties'] / total_games * 100
+        
+        end_time = time.time()
+        results['performance'] = {
+            'total_time': end_time - start_time,
+            'games_per_second': num_simulations / (end_time - start_time),
+            'batch_size': 1
+        }
+        
+        return results
+
+    def initialize_deck_gpu(self):
+        """初始化牌堆（與主程式相同）"""
+        deck = []
+        for _ in range(self.decks):
+            for card in self.card_names:
+                deck.extend([card] * 4)
+        return deck
+
+class BaccaratAIAssistant:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("百家樂 AI 算牌預測 v3.8.4 - GPU-DP-V2.1（趨勢優化修復版）")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#1a1a1a')
+        
+        # GPU 相關初始化
+        self.gpu_enabled = GPU_AVAILABLE
+        self.gpu_simulator = None
+        if self.gpu_enabled:
+            try:
+                self.gpu_simulator = BaccaratGPUSimulator()
+                print("✓ GPU模擬器初始化成功 - v3.8.4趨勢優化系統")
+            except Exception as e:
+                print(f"✗ GPU模擬器初始化失敗: {e}")
+                self.gpu_enabled = False
+        else:
+            print("✗ GPU不可用，使用CPU模擬")
+        
+        # 初始化數據
+        self.game_count = 1
+        self.a_count = 0
+        self.decks = 10
+        self.simulation_running = False
+        self.simulation_stop_flag = False
+        self.export_path = os.getcwd()
+        
+        # 趨勢加速相關變量（與GPU模擬器完全一致）- v3.8.4優化參數
+        self.previous_changes = {
+            'banker': 0.0,
+            'player': 0.0, 
+            'tie': 0.0
+        }
+        self.trend_strength = {
+            'banker': 0.0,
+            'player': 0.0,
+            'tie': 0.0
+        }
+        self.consecutive_no_recommendation = 0
+        
+        # 趨勢過濾參數 - v3.8.4大幅放寬
+        self.trend_filter_enabled = True
+        self.min_trend_strength = 0.01  # 從0.1降低到0.01
+        self.acceleration_threshold = 0.05  # 從0.1降低到0.05
+        self.max_trend_strength = 15.0  # 從10.0增加到15.0
+        
+        # 累積變化率系統（與GPU模擬器一致）- v3.8.4放寬限制
+        self.cumulative_changes = {
+            'banker': 0.0,
+            'player': 0.0,
+            'tie': 0.0
+        }
+        self.max_cumulative_change = 8.0  # 從5.0增加到8.0
+        self.change_history = {
+            'banker': [],
+            'player': [],
+            'tie': []
+        }
+        
+        # 趨勢強度衰減計數器（與GPU模擬器一致）- v3.8.4優化
+        self.trend_decay_counter = {
+            'banker': 0,
+            'player': 0,
+            'tie': 0
+        }
+        self.base_decay_rate = 0.03  # 從0.05降低到0.03
+        
+        self.current_cards = []
+        self.manual_threshold_set = False
+        
+        # 策略參數 - 專注莊閒
+        self.observe_bp = True
+        self.observe_tie = False
+        self.observe_pair = False
+        self.observe_big_small = False
+        
+        # 推薦閾值參數
+        self.THRESHOLD_min_games = 1
+        self.THRESHOLD_max_games = 100
+        self.threshold_group = "standard"
+        
+        # 基礎概率
+        self.base_probabilities = {
+            'banker': 45.851,
+            'player': 44.695,
+            'tie': 9.454,
+            'banker_pair': 14.642,
+            'player_pair': 14.642,
+            'big': 62.113,
+            'small': 37.887,
+            'lucky_six': 8.331
+        }
+        
+        # 賠率設定
+        self.payouts = {
+            'banker': 0.95,
+            'player': 1.0,
+            'tie': 8.0,
+            'banker_pair': 11.0,
+            'player_pair': 11.0,
+            'big': 1.5,
+            'small': 1.5,
+            'lucky_six': 12.0
+        }
+        
+        self.current_probs = self.base_probabilities.copy()
+        self.history = []
+        self.card_count = defaultdict(int)
+        self.remaining_deck = self.initialize_deck(self.decks)
+        
+        self.recommendation_stats = {
+            'banker': {'bet': 0, 'win': 0, 'amount': 0},
+            'player': {'bet': 0, 'win': 0, 'amount': 0},
+            'tie': {'bet': 0, 'win': 0, 'amount': 0}
+        }
+        
+        self.current_result = ""
+        self.current_recommendation_snapshot = None
+        self.auto_sim_results = []
+        
+        # GPU模擬結果存儲
+        self.gpu_simulation_history = []
+        self.gpu_detailed_results = []
+        
+        self.setup_ui()
+        self.update_probabilities_display_only()
+
+    # GPU 加速相關方法
+    def start_gpu_simulation(self, num_simulations=10000):
+        """啟動GPU大規模模擬 - v3.8.4 趨勢優化版本"""
+        if not self.gpu_enabled:
+            messagebox.showwarning("GPU不可用", "GPU加速不可用，將使用CPU模擬")
+            return self.start_auto_simulate()
+        
+        if self.simulation_running:
+            return
+            
+        self.simulation_running = True
+        self.simulation_stop_flag = False
+        
+        self.data_status_label.config(text=f"GPU大規模模擬中... 0/{num_simulations}", fg='#ff00ff')
+        
+        def gpu_simulation_thread():
+            try:
+                start_time = time.time()
+                
+                print(f"🎮 開始GPU模擬: {num_simulations}局 - 使用v3.8.4趨勢優化系統")
+                results = self.gpu_simulator.mass_simulation(num_simulations)
+                
+                end_time = time.time()
+                simulation_time = end_time - start_time
+                
+                self.root.after(0, lambda: self.process_gpu_results(
+                    results, num_simulations, simulation_time
+                ))
+                
+            except Exception as e:
+                print(f"❌ GPU模擬錯誤: {e}")
+                self.root.after(0, lambda: self.fallback_to_cpu_simulation(num_simulations))
+        
+        thread = threading.Thread(target=gpu_simulation_thread)
+        thread.daemon = True
+        thread.start()
+
+    def process_gpu_results(self, results, num_simulations, simulation_time):
+        """處理GPU模擬結果並整合到歷史數據"""
+        self.simulation_running = False
+        
+        gpu_sim_record = {
+            'type': 'gpu_simulation',
+            'timestamp': datetime.now(),
+            'num_simulations': num_simulations,
+            'simulation_time': simulation_time,
+            'results': results,
+            'performance': results.get('performance', {}),
+            'detailed_results': results.get('detailed_results', [])
+        }
+        
+        self.gpu_simulation_history.append(gpu_sim_record)
+        self.gpu_detailed_results.extend(results.get('detailed_results', []))
+        
+        self.convert_gpu_to_standard_history(results, num_simulations)
+        
+        speed = num_simulations / simulation_time
+        performance_info = f"GPU模擬完成: {num_simulations}局 | 用時: {simulation_time:.2f}秒 | 速度: {speed:.0f}局/秒"
+        
+        result_text = f"{performance_info}\n\n"
+        result_text += f"莊家勝: {results['banker_wins']}局 ({results['banker_win_rate']:.2f}%)\n"
+        result_text += f"閒家勝: {results['player_wins']}局 ({results['player_win_rate']:.2f}%)\n"
+        result_text += f"和局: {results['ties']}局 ({results['tie_rate']:.2f}%)\n\n"
+        
+        gpu_stats = self.calculate_gpu_recommendation_stats(results['detailed_results'])
+        result_text += "=== 推薦項目統計 ===\n"
+        total_bet = 0
+        total_win = 0
+        total_amount = 0
+        reverse_count = 0
+        
+        for bet_type, stats in gpu_stats.items():
+            if stats['bet'] > 0:
+                win_rate = stats['win'] / stats['bet'] * 100 if stats['bet'] > 0 else 0
+                chinese_name = self.get_chinese_name(bet_type)
+                reverse_indicator = "🔄" if stats.get('is_reverse', False) else ""
+                result_text += f"推薦{reverse_indicator}{chinese_name}: {stats['win']}/{stats['bet']} ({win_rate:.1f}%)，淨利: {stats['amount']:.2f}\n"
+                total_bet += stats['bet']
+                total_win += stats['win']
+                total_amount += stats['amount']
+                if stats.get('is_reverse', False):
+                    reverse_count += stats['bet']
+        
+        if total_bet > 0:
+            overall_win_rate = total_win / total_bet * 100
+            reverse_rate = (reverse_count / total_bet) * 100 if total_bet > 0 else 0
+            result_text += f"\n總計: {total_win}/{total_bet} ({overall_win_rate:.1f}%)，總淨利: {total_amount:.2f}\n"
+            result_text += f"反向推薦: {reverse_count}局 ({reverse_rate:.1f}%)\n"
+        
+        result_text += f"\n✓ GPU模擬數據已整合到歷史記錄中，共{len(results['detailed_results'])}筆詳細記錄"
+        result_text += f"\n✓ 使用v3.8.4趨勢優化系統 - 推薦率大幅提升"
+        
+        messagebox.showinfo("GPU模擬結果 v3.8.4", result_text)
+        
+        self.data_status_label.config(text=f"GPU模擬完成 - {speed:.0f}局/秒 - 趨勢優化系統", fg='#00ff00')
+        
+        self.update_recommendation_display()
+
+    def calculate_gpu_recommendation_stats(self, detailed_results):
+        """計算GPU模擬的推薦統計"""
+        stats = {
+            'banker': {'bet': 0, 'win': 0, 'amount': 0, 'is_reverse': False},
+            'player': {'bet': 0, 'win': 0, 'amount': 0, 'is_reverse': False},
+            'tie': {'bet': 0, 'win': 0, 'amount': 0, 'is_reverse': False}
+        }
+        
+        for result in detailed_results:
+            bet_type = result.get('recommendation')
+            bet_level = result.get('bet_level', 0)
+            is_reverse = result.get('is_reverse', False)
+            
+            if bet_type and bet_level > 0:
+                stats[bet_type]['bet'] += bet_level
+                stats[bet_type]['is_reverse'] = is_reverse
+                
+                if result.get('result') == '✓':
+                    stats[bet_type]['win'] += bet_level
+                    if bet_type == 'banker':
+                        stats[bet_type]['amount'] += bet_level * 0.95
+                    elif bet_type == 'player':
+                        stats[bet_type]['amount'] += bet_level * 1.0
+                    else:
+                        stats[bet_type]['amount'] += bet_level * 7.0
+                elif result.get('result') == '✗':
+                    stats[bet_type]['amount'] -= bet_level
+        
+        return stats
+
+    def convert_gpu_to_standard_history(self, results, num_simulations):
+        """將GPU模擬結果轉換為標準歷史格式"""
+        detailed_results = results.get('detailed_results', [])
+        
+        for i, gpu_result in enumerate(detailed_results):
+            record = {
+                'round': self.game_count + i,
+                'type': 'gpu_simulated',
+                'cards': [],
+                'banker_hand': gpu_result.get('banker_hand', []),
+                'player_hand': gpu_result.get('player_hand', []),
+                'banker_score': gpu_result.get('banker_score', 0),
+                'player_score': gpu_result.get('player_score', 0),
+                'winner': gpu_result.get('winner', ''),
+                'winner_chinese': gpu_result.get('winner_chinese', ''),
+                'recommendation': gpu_result.get('recommendation'),
+                'recommendation_chinese': self.get_chinese_name(gpu_result.get('recommendation', '')),
+                'bet_level': gpu_result.get('bet_level', 0),
+                'is_reverse': gpu_result.get('is_reverse', False),
+                'probabilities': gpu_result.get('probabilities', self.base_probabilities.copy()),
+                'recommendation_result': gpu_result.get('result_text', ''),
+                'changes': gpu_result.get('changes', {}),
+                'timestamp': datetime.now(),
+                'simulation_id': i,
+                'consistency_version': 'v3.8.4'  # 標記趨勢優化版本
+            }
+            
+            self.history.append(record)
+        
+        self.game_count += len(detailed_results)
+
+    def fallback_to_cpu_simulation(self, num_simulations):
+        """回退到CPU模擬"""
+        messagebox.showinfo("切換到CPU", "GPU模擬失敗，切換到CPU模擬")
+        self.start_auto_simulate()
+
+    def calculate_acceleration(self, current_change, previous_change):
+        """計算變化率加速（當前變化率 - 上一局變化率）"""
+        return current_change - previous_change
+
+    def update_trend_strength(self, bet_type, acceleration, percentage_change):
+        """更新趨勢強度計數器 - v3.8.4優化版本"""
+        current_strength = self.trend_strength[bet_type]
+        
+        if acceleration > self.acceleration_threshold:  # 0.05
+            strength_increment = max(0.05, min(2.0, abs(acceleration) * 0.5))  # 乘數從0.3增加到0.5
+            
+            # 放寬強度限制
+            if current_strength > 8.0:  # 從5.0增加到8.0
+                strength_increment *= 0.6  # 從0.5增加到0.6
+            elif current_strength > 5.0:  # 從3.0增加到5.0
+                strength_increment *= 0.8  # 從0.7增加到0.8
+                
+            new_strength = current_strength + strength_increment
+            self.trend_strength[bet_type] = min(self.max_trend_strength, new_strength)
+            self.trend_decay_counter[bet_type] = 0
+            
+        elif acceleration < -self.acceleration_threshold:
+            strength_decrement = max(0.05, min(2.0, abs(acceleration) * 0.5))  # 乘數從0.3增加到0.5
+            new_strength = current_strength - strength_decrement
+            self.trend_strength[bet_type] = max(-self.max_trend_strength, new_strength)
+            self.trend_decay_counter[bet_type] = 0
+            
+        else:
+            self.trend_decay_counter[bet_type] += 1
+            
+            # 降低衰減率
+            decay_rate = self.base_decay_rate  # 0.03
+            if abs(current_strength) > 10.0:  # 從8.0增加到10.0
+                decay_rate = 0.12  # 從0.15降低到0.12
+            elif abs(current_strength) > 6.0:  # 從5.0增加到6.0
+                decay_rate = 0.08  # 從0.10降低到0.08
+            elif abs(current_strength) > 3.0:
+                decay_rate = 0.05  # 從0.07降低到0.05
+                
+            decay_multiplier = min(2.5, 1.0 + (self.trend_decay_counter[bet_type] * 0.08))  # 乘數從0.1降低到0.08
+            decay_rate *= decay_multiplier
+            
+            if current_strength > 0:
+                self.trend_strength[bet_type] = max(0, current_strength - decay_rate)
+            elif current_strength < 0:
+                self.trend_strength[bet_type] = min(0, current_strength + decay_rate)
+        
+        # 增加累積變化效果
+        cumulative_effect = percentage_change * 0.03  # 從0.02增加到0.03
+        self.cumulative_changes[bet_type] += cumulative_effect
+        self.cumulative_changes[bet_type] = max(-self.max_cumulative_change, 
+                                               min(self.max_cumulative_change, 
+                                                   self.cumulative_changes[bet_type]))
+        
+        self.change_history[bet_type].append(percentage_change)
+        if len(self.change_history[bet_type]) > 5:
+            self.change_history[bet_type].pop(0)
+        
+        if len(self.change_history[bet_type]) >= 3:
+            recent_changes = self.change_history[bet_type][-3:]
+            if all(c > 0 for c in recent_changes) or all(c < 0 for c in recent_changes):
+                pattern_bonus = 0.2
+                if self.trend_strength[bet_type] > 0:
+                    self.trend_strength[bet_type] = min(self.max_trend_strength, 
+                                                       self.trend_strength[bet_type] + pattern_bonus)
+                else:
+                    self.trend_strength[bet_type] = max(-self.max_trend_strength, 
+                                                       self.trend_strength[bet_type] - pattern_bonus)
+
+    def get_dynamic_acceleration_threshold(self):
+        """根據連續無推薦局數動態調整加速閾值 - v3.8.4優化版本"""
+        base_threshold = self.acceleration_threshold  # 0.05
+        
+        # 減少連續無推薦的懲罰
+        if self.consecutive_no_recommendation >= 10:  # 從8增加到10
+            return base_threshold * 0.5  # 從0.3增加到0.5
+        elif self.consecutive_no_recommendation >= 6:  # 從5增加到6
+            return base_threshold * 0.7  # 從0.5增加到0.7
+        elif self.consecutive_no_recommendation >= 3:
+            return base_threshold * 0.85  # 從0.7增加到0.85
+        else:
+            return base_threshold
+
+    def get_bet_recommendation(self, bet_type, percentage_change, acceleration):
+        """根據概率變化百分比和加速獲取下注推薦（v3.8.4趨勢優化版本）"""
+        if bet_type not in thresholds_dict:
+            return 0, bet_type, False
+        
+        if bet_type == 'tie':
+            return 0, bet_type, False
+        
+        current_accel_threshold = self.get_dynamic_acceleration_threshold()
+        
+        # 大幅降低趨勢過濾閾值
+        if self.trend_filter_enabled and abs(self.trend_strength[bet_type]) < self.min_trend_strength:
+            return 0, bet_type, False
+        
+        current_prob = self.current_probs[bet_type]
+        final_bet_type = bet_type
+        cumulative_bonus = 0
+        is_reverse = False
+        
+        # 放寬累積變化獎勵門檻
+        if abs(self.cumulative_changes[bet_type]) > 0.5:  # 從1.0降低到0.5
+            cumulative_bonus = min(2, int(abs(self.cumulative_changes[bet_type]) * 2))  # 獎勵加倍
+        
+        # 首先檢查精準反向邏輯
+        reverse_bet, reverse_level = improved_reverse_evaluation(
+            bet_type, current_prob, percentage_change, acceleration, 
+            {
+                'trend_strength': self.trend_strength,
+                'cumulative_changes': self.cumulative_changes,
+                'change_history': self.change_history
+            }, 
+            reverse_thresholds_dict[bet_type].get("reverse_1", {})
+        )
+        
+        if reverse_bet and reverse_level > 0:
+            final_bet_type = reverse_bet
+            base_level = reverse_level
+            is_reverse = True
+        else:
+            # 原有閾值判斷邏輯
+            for level in ['7', '6', '5', '4', '3', '2', '1']:
+                if level in thresholds_dict[bet_type]:
+                    threshold = thresholds_dict[bet_type][level]
+                    
+                    if current_prob < threshold.get("min_prob", 0):
+                        continue
+                    
+                    if (threshold["min_change"] <= abs(percentage_change) < threshold["max_change"] and 
+                        acceleration >= threshold["min_accel"]):
+                        
+                        base_level = threshold["level"]
+                        
+                        if threshold.get("reverse", False) or threshold.get("win_rate", 50) < 49:
+                            final_bet_type = 'player' if bet_type == 'banker' else 'banker'
+                            base_level = 1
+                            is_reverse = True
+                        
+                        if not threshold.get("reverse", False) and threshold.get("win_rate", 50) >= 49:
+                            final_level = min(20, base_level + cumulative_bonus)
+                        else:
+                            final_level = base_level
+                        
+                        return final_level, final_bet_type, is_reverse
+        
+        # 反向邏輯的等級計算
+        if is_reverse:
+            trend_state = {
+                'trend_strength': self.trend_strength,
+                'cumulative_changes': self.cumulative_changes
+            }
+            reverse_level_adjusted = get_reverse_bet_level(
+                bet_type, current_prob, percentage_change, acceleration, trend_state
+            )
+            final_level = max(1, min(5, base_level + reverse_level_adjusted))
+            
+            return final_level, final_bet_type, is_reverse
+        
+        return 0, bet_type, False
+
+    def initialize_deck(self, num_decks=10):
+        deck = []
+        for _ in range(num_decks):
+            for card in card_names:
+                deck.extend([card] * 4)
+        random.shuffle(deck)
+        return deck
+
+    def calculate_baccarat_score(self, hand):
+        return sum(card_values[card] for card in hand) % 10
+
+    def should_player_draw(self, player_score, banker_score):
+        if player_score >= 8 or banker_score >= 8:
+            return False
+        return player_score < 6
+
+    def should_banker_draw(self, banker_score, player_score, player_drew, player_third_card_value=None):
+        if player_score >= 8 or banker_score >= 8:
+            return False
+            
+        if not player_drew:
+            return banker_score < 6
+        else:
+            if banker_score <= 2:
+                return True
+            elif banker_score == 3:
+                return player_third_card_value != 8
+            elif banker_score == 4:
+                return player_third_card_value in [2, 3, 4, 5, 6, 7]
+            elif banker_score == 5:
+                return player_third_card_value in [4, 5, 6, 7]
+            elif banker_score == 6:
+                return player_third_card_value in [6, 7]
+            else:
+                return False
+
+    def simulate_baccarat_round(self, input_cards=None):
+        if len(self.remaining_deck) < 6:
+            self.remaining_deck = self.initialize_deck(self.decks)
+            print("牌堆不足，重新洗牌")
+        
+        if input_cards and len(input_cards) >= 4:
+            player_hand = [input_cards[0], input_cards[1]]
+            banker_hand = [input_cards[2], input_cards[3]]
+            
+            for card in input_cards[:4]:
+                if card in self.remaining_deck:
+                    self.remaining_deck.remove(card)
+        else:
+            player_hand = [self.remaining_deck.pop(0), self.remaining_deck.pop(0)]
+            banker_hand = [self.remaining_deck.pop(0), self.remaining_deck.pop(0)]
+        
+        player_score = self.calculate_baccarat_score(player_hand)
+        banker_score = self.calculate_baccarat_score(banker_hand)
+        
+        player_drew = False
+        player_third_card_value = None
+        
+        if self.should_player_draw(player_score, banker_score):
+            if input_cards and len(input_cards) >= 5:
+                player_third_card = input_cards[4]
+                if player_third_card in self.remaining_deck:
+                    self.remaining_deck.remove(player_third_card)
+            else:
+                player_third_card = self.remaining_deck.pop(0)
+                
+            player_hand.append(player_third_card)
+            player_score = self.calculate_baccarat_score(player_hand)
+            player_drew = True
+            player_third_card_value = card_values[player_third_card]
+        
+        if self.should_banker_draw(banker_score, player_score, player_drew, player_third_card_value):
+            if input_cards and len(input_cards) >= 6:
+                banker_third_card = input_cards[5]
+                if banker_third_card in self.remaining_deck:
+                    self.remaining_deck.remove(banker_third_card)
+            else:
+                banker_third_card = self.remaining_deck.pop(0)
+                
+            banker_hand.append(banker_third_card)
+            banker_score = self.calculate_baccarat_score(banker_hand)
+        
+        return banker_hand, player_hand, banker_score, player_score
+
+    def calculate_remaining_probabilities(self):
+        total_cards = len(self.remaining_deck)
+        total_initial_cards = self.decks * 52
+        
+        if total_cards < 20:
+            self.remaining_deck = self.initialize_deck(self.decks)
+            self.current_probs = self.base_probabilities.copy()
+            return
+        
+        card_counts = {}
+        for card in card_names:
+            count = self.remaining_deck.count(card)
+            card_counts[card] = count
+        
+        point_ratios = {}
+        for point in range(0, 10):
+            if point == 0:
+                cards_for_point = ['10', 'J', 'Q', 'K']
+            else:
+                cards_for_point = [card for card in card_names if card_values[card] == point]
+            
+            total_count = sum(card_counts[card] for card in cards_for_point)
+            point_ratios[point] = total_count / total_cards
+        
+        high_card_ratio = point_ratios[0]
+        low_card_ratio = sum(point_ratios[i] for i in [1, 2, 3, 4, 5])
+        medium_card_ratio = sum(point_ratios[i] for i in [6, 7])
+        eight_nine_ratio = sum(point_ratios[i] for i in [8, 9])
+        
+        banker_adjust = (eight_nine_ratio - 0.158) * 8 - (low_card_ratio - 0.385) * 4
+        player_adjust = (low_card_ratio - 0.385) * 8 - (eight_nine_ratio - 0.158) * 4
+        tie_adjust = (medium_card_ratio - 0.308) * 6
+        
+        consumption_ratio = (total_initial_cards - total_cards) / total_initial_cards
+        consumption_effect = consumption_ratio * 2
+        
+        self.current_probs['banker'] = self.base_probabilities['banker'] + banker_adjust + consumption_effect
+        self.current_probs['player'] = self.base_probabilities['player'] + player_adjust - consumption_effect
+        self.current_probs['tie'] = self.base_probabilities['tie'] + tie_adjust
+        
+        self.current_probs['banker'] = max(40.0, min(52.0, self.current_probs['banker']))
+        self.current_probs['player'] = max(40.0, min(52.0, self.current_probs['player']))
+        self.current_probs['tie'] = max(5.0, min(15.0, self.current_probs['tie']))
+        
+        self.normalize_probabilities()
+
+    def normalize_probabilities(self):
+        total = sum(self.current_probs[bet] for bet in ['banker', 'player', 'tie'])
+        if total > 0:
+            scale = 100.0 / total
+            for bet in ['banker', 'player', 'tie']:
+                self.current_probs[bet] *= scale
+                self.current_probs[bet] = round(self.current_probs[bet], 3)
+
+    def calculate_ev(self, probability, payout):
+        win_prob = probability / 100
+        return (win_prob * payout) - ((1 - win_prob) * 1)
+
+    def calculate_percentage_change(self, current_prob, base_prob):
+        if base_prob == 0:
+            return 0
+        return ((current_prob - base_prob) / base_prob) * 100
+
+    def get_recommendation_text(self, bet_type):
+        if bet_type not in self.current_probs:
+            return None
+            
+        current_prob = self.current_probs[bet_type]
+        base_prob = self.base_probabilities[bet_type]
+        payout = self.payouts[bet_type]
+        ev = self.calculate_ev(current_prob, payout)
+        
+        percentage_change = self.calculate_percentage_change(current_prob, base_prob)
+        
+        acceleration = self.calculate_acceleration(percentage_change, self.previous_changes[bet_type])
+        
+        self.update_trend_strength(bet_type, acceleration, percentage_change)
+        
+        bet_level, final_bet_type, is_reverse = self.get_bet_recommendation(bet_type, percentage_change, acceleration)
+        
+        if bet_type == 'tie' and not self.observe_tie:
+            return None
+        
+        chinese_names = {'banker': '莊', 'player': '閒', 'tie': '和'}
+        
+        # 等級圖標（包含反向標記）
+        level_icons = {
+            20: '🔥🔥🔥🔥🔥🔥 下20注',
+            19: '🔥🔥🔥🔥🔥 下19注',
+            18: '🔥🔥🔥🔥🔥 下18注',
+            17: '🔥🔥🔥🔥 下17注',
+            16: '🔥🔥🔥🔥 下16注',
+            15: '🔥🔥🔥🔥 下15注',
+            14: '🔥🔥🔥 下14注',
+            13: '🔥🔥🔥 下13注',
+            12: '🔥🔥🔥 下12注',
+            11: '🔥🔥 下11注',
+            10: '🔥🔥🔥🔥🔥 下10注',
+            9: '🔥🔥🔥🔥 下9注',
+            8: '🔥🔥🔥 下8注',
+            7: '🔥🔥 下7注',
+            6: '🔥 下6注',
+            5: '🔥🔥🔥🔥 下5注',
+            4: '🔥🔥🔥 下4注', 
+            3: '🔥🔥 下3注',
+            2: '🔥 下2注',
+            1: '⚡ 下1注',
+            0: '⚪ 不下注'
+        }
+        
+        # 確保 bet_level 在 level_icons 中有對應的鍵
+        if bet_level not in level_icons:
+            available_levels = sorted(level_icons.keys(), reverse=True)
+            for level in available_levels:
+                if bet_level >= level:
+                    bet_level = level
+                    break
+            else:
+                bet_level = 0
+        
+        trend_icon = "↑" if acceleration > 0 else "↓" if acceleration < 0 else "→"
+        trend_strength = f"{abs(self.trend_strength[bet_type]):.1f}"
+        cumulative_change = f"{self.cumulative_changes[bet_type]:.2f}"
+        decay_counter = self.trend_decay_counter[bet_type]
+        
+        win_rate_info = ""
+        for level in ['7', '6', '5', '4', '3', '2', '1']:
+            if level in thresholds_dict[bet_type]:
+                threshold = thresholds_dict[bet_type][level]
+                if (threshold["min_change"] <= abs(percentage_change) < threshold["max_change"] and 
+                    acceleration >= threshold["min_accel"] and
+                    current_prob >= threshold.get("min_prob", 0)):
+                    win_rate_info = f" | 勝率: {threshold.get('win_rate', 50):.1f}%"
+                    break
+        
+        reverse_indicator = "🔄 " if is_reverse else ""
+        
+        recommendation_text = (
+            f"{reverse_indicator}{chinese_names[final_bet_type]}:\n"
+            f"  概率: {current_prob:.3f} (基{base_prob:.3f})\n"
+            f"  變化: {percentage_change:+.2f}% | 加速: {acceleration:+.2f}% {trend_icon}{win_rate_info}\n"
+            f"  趨勢強度: {trend_strength} | 累積: {cumulative_change}% | 衰減計數: {decay_counter}\n"
+            f"  EV: {ev:+.3f} | 推薦: {level_icons[bet_level]}\n"
+            f"{'='*30}\n"
+        )
+        
+        return {
+            'text': recommendation_text,
+            'level': bet_level,
+            'ev': ev,
+            'change': percentage_change,
+            'acceleration': acceleration,
+            'bet_type': final_bet_type,
+            'current_prob': current_prob,
+            'base_prob': base_prob,
+            'trend_strength': self.trend_strength[bet_type],
+            'cumulative_change': self.cumulative_changes[bet_type],
+            'decay_counter': decay_counter,
+            'is_reverse': is_reverse
+        }
+
+    def get_top_recommendation(self):
+        recommendations = []
+        
+        for bet_type in ['banker', 'player']:
+            recommendation = self.get_recommendation_text(bet_type)
+            if recommendation and recommendation['level'] > 0:
+                recommendations.append(recommendation)
+        
+        if recommendations:
+            recommendations.sort(key=lambda x: (x['level'], abs(x['trend_strength'])), reverse=True)
+            return recommendations[0]['bet_type'], recommendations[0]['level'], recommendations
+        else:
+            self.consecutive_no_recommendation += 1
+            
+            all_recommendations = []
+            for bet_type in ['banker', 'player']:
+                rec = self.get_recommendation_text(bet_type)
+                if rec:
+                    all_recommendations.append(rec)
+            return None, 0, all_recommendations
+
+    def take_recommendation_snapshot(self):
+        snapshot = {
+            'banker': self.get_recommendation_text('banker'),
+            'player': self.get_recommendation_text('player'),
+            'timestamp': self.game_count
+        }
+        return snapshot
+
+    def update_probabilities_display_only(self):
+        if len(self.current_cards) > 0:
+            self.calculate_remaining_probabilities()
+        
+        for key, label in self.prob_labels.items():
+            label.config(text=f"{self.current_probs[key]:.3f}")
+        
+        gpu_status = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+        self.status_label.config(text=f"局數：#{self.game_count} | A牌：{self.a_count} | 剩餘牌：{len(self.remaining_deck)} | 推薦範圍：{self.THRESHOLD_min_games}-{self.THRESHOLD_max_games}局{gpu_status}")
+        
+        if self.game_count < self.THRESHOLD_min_games:
+            status_text = f"等待推薦範圍（{self.THRESHOLD_min_games}局開始）"
+            color = '#ff6666'
+        elif self.game_count <= self.THRESHOLD_max_games:
+            status_text = "推薦範圍內，分析中..."
+            color = '#ffcc00'
+        else:
+            status_text = "已超出推薦範圍"
+            color = '#00cc66'
+            
+        if self.trend_filter_enabled:
+            status_text += f" | 趨勢過濾(強度≥{self.min_trend_strength})"
+            color = '#00ff00'
+            
+        self.data_status_label.config(text=status_text, fg=color)
+        
+        self.update_recommendation_display()
+
+    # UI設置 - 完全恢復v3.8.4佈局
+    def setup_ui(self):
+        title_frame = tk.Frame(self.root, bg='#2d2d2d', height=50)
+        title_frame.pack(fill=tk.X, padx=10, pady=3)
+        title_frame.pack_propagate(False)
+        
+        title_text = "百家樂 AI 算牌預測 v3.8.4 - GPU-DP-V2.1（趨勢優化修復版）"
+        if self.gpu_enabled:
+            title_text += " - GPU加速已啟用"
+        else:
+            title_text += " - GPU加速不可用"
+            
+        tk.Label(title_frame, text=title_text, 
+                font=('Microsoft YaHei', 14, 'bold'), fg='white', bg='#2d2d2d').pack(expand=True)
+        
+        status_frame = tk.Frame(self.root, bg='#333333', height=35)
+        status_frame.pack(fill=tk.X, padx=10, pady=2)
+        status_frame.pack_propagate(False)
+        
+        gpu_status = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+        self.status_label = tk.Label(status_frame, 
+                                    text=f"局數：#{self.game_count} | A牌：{self.a_count} | 剩餘牌：{len(self.remaining_deck)} | 推薦範圍：{self.THRESHOLD_min_games}-{self.THRESHOLD_max_games}局{gpu_status}",
+                                    font=('Microsoft YaHei', 10), fg='#ffcc00', bg='#333333')
+        self.status_label.pack(side=tk.LEFT, padx=10)
+        
+        self.data_status_label = tk.Label(status_frame, text=f"v3.8.4趨勢優化系統 - 最小強度:{self.min_trend_strength}",
+                                         font=('Microsoft YaHei', 10), fg='#00ff00', bg='#333333')
+        self.data_status_label.pack(side=tk.RIGHT, padx=10)
+        
+        main_frame = tk.Frame(self.root, bg='#1a1a1a')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=3)
+        
+        left_frame = tk.Frame(main_frame, bg='#2d2d2d', width=400)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        left_frame.pack_propagate(False)
+        
+        right_frame = tk.Frame(main_frame, bg='#1a1a1a')
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        self.setup_recommendation_panel(left_frame)
+        self.setup_table_panel(right_frame)
+        
+    def setup_recommendation_panel(self, parent):
+        param_frame = tk.LabelFrame(parent, text="參數設定 v3.8.4", font=('Microsoft YaHei', 10, 'bold'),
+                                  fg='white', bg='#2d2d2d', bd=1, height=180)
+        param_frame.pack(fill=tk.X, padx=5, pady=3)
+        param_frame.pack_propagate(False)
+        
+        # GPU控制
+        gpu_frame = tk.Frame(param_frame, bg='#2d2d2d')
+        gpu_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        if self.gpu_enabled:
+            gpu_color = '#00ff00'
+            gpu_text = "GPU加速: 可用 (v3.8.4趨勢優化系統)"
+        else:
+            gpu_color = '#ff6666'
+            gpu_text = "GPU加速: 不可用"
+            
+        tk.Label(gpu_frame, text=gpu_text, font=('Microsoft YaHei', 9, 'bold'),
+                fg=gpu_color, bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        # 趨勢過濾控制
+        trend_frame = tk.Frame(param_frame, bg='#2d2d2d')
+        trend_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.trend_filter_var = tk.BooleanVar(value=self.trend_filter_enabled)
+        trend_check = tk.Checkbutton(trend_frame, text="趨勢過濾", variable=self.trend_filter_var,
+                                   command=self.toggle_trend_filter, font=('Microsoft YaHei', 9),
+                                   fg='white', bg='#2d2d2d', selectcolor='#1a1a1a')
+        trend_check.pack(side=tk.LEFT)
+        
+        tk.Label(trend_frame, text="最小趨勢強度:", font=('Microsoft YaHei', 8), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT, padx=(10,2))
+        
+        self.min_trend_var = tk.StringVar(value="0.001")  # 直接設置為0.001
+        trend_spinbox = tk.Spinbox(trend_frame, from_=0.001, to=0.5, increment=0.001, width=8,
+                                 textvariable=self.min_trend_var, command=self.update_trend_settings,
+                                 font=('Microsoft YaHei', 8))
+        trend_spinbox.pack(side=tk.LEFT, padx=2)
+        
+        range_frame = tk.Frame(param_frame, bg='#2d2d2d')
+        range_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(range_frame, text="推薦範圍:", font=('Microsoft YaHei', 9), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.min_games_var = tk.StringVar(value=str(self.THRESHOLD_min_games))
+        min_spinbox = tk.Spinbox(range_frame, from_=1, to=100, width=4,
+                               textvariable=self.min_games_var, command=self.update_thresholds,
+                               font=('Microsoft YaHei', 8))
+        min_spinbox.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(range_frame, text="局~", font=('Microsoft YaHei', 8), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.max_games_var = tk.StringVar(value=str(self.THRESHOLD_max_games))
+        max_spinbox = tk.Spinbox(range_frame, from_=10, to=200, width=4,
+                               textvariable=self.max_games_var, command=self.update_thresholds,
+                               font=('Microsoft YaHei', 8))
+        max_spinbox.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(range_frame, text="局", font=('Microsoft YaHei', 8), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        auto_frame = tk.Frame(param_frame, bg='#2d2d2d')
+        auto_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        tk.Label(auto_frame, text="自動模擬:", font=('Microsoft YaHei', 9), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        self.auto_games_var = tk.StringVar(value="100")
+        auto_spinbox = tk.Spinbox(auto_frame, from_=1, to=100000, width=8,
+                                textvariable=self.auto_games_var,
+                                font=('Microsoft YaHei', 8))
+        auto_spinbox.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(auto_frame, text="局", font=('Microsoft YaHei', 8), 
+                fg='white', bg='#2d2d2d').pack(side=tk.LEFT)
+        
+        sim_btn_frame = tk.Frame(auto_frame, bg='#2d2d2d')
+        sim_btn_frame.pack(side=tk.RIGHT, padx=5)
+        
+        tk.Button(sim_btn_frame, text="GPU模擬", font=('Microsoft YaHei', 8),
+                 command=lambda: self.start_gpu_simulation(int(self.auto_games_var.get())), 
+                 bg='#9b59b6', fg='white', width=8).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(sim_btn_frame, text="CPU模擬", font=('Microsoft YaHei', 8),
+                 command=self.start_auto_simulate, bg='#e74c3c', width=8).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(sim_btn_frame, text="停止", font=('Microsoft YaHei', 8),
+                 command=self.stop_auto_simulate, bg='#95a5a6', width=6).pack(side=tk.LEFT, padx=2)
+        
+        strategy_frame = tk.LabelFrame(parent, text="策略設定", font=('Microsoft YaHei', 10, 'bold'),
+                                      fg='white', bg='#2d2d2d', bd=1, height=60)
+        strategy_frame.pack(fill=tk.X, padx=5, pady=3)
+        strategy_frame.pack_propagate(False)
+        
+        btn_frame = tk.Frame(strategy_frame, bg='#2d2d2d')
+        btn_frame.pack(fill=tk.X, padx=3, pady=2)
+        
+        tk.Button(btn_frame, text="莊閒專用", font=('Microsoft YaHei', 8),
+                 command=lambda: self.set_strategy('bp'), bg='#3498db', width=8).pack(side=tk.LEFT, padx=1)
+        
+        strategy_text = f"當前: 莊閒專用策略 | v3.8.4趨勢優化系統"
+        if self.gpu_enabled:
+            strategy_text += " | GPU加速"
+            
+        self.strategy_label = tk.Label(strategy_frame, text=strategy_text, 
+                                      font=('Microsoft YaHei', 9), fg='#ffcc00', bg='#2d2d2d')
+        self.strategy_label.pack(pady=1)
+        
+        ai_frame = tk.LabelFrame(parent, text="AI推薦下注", font=('Microsoft YaHei', 12, 'bold'),
+                                fg='white', bg='#2d2d2d', bd=2)
+        ai_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=3)
+        
+        self.recommendation_text = tk.Text(ai_frame, height=12, font=('Microsoft YaHei', 9),
+                                          fg='white', bg='#1a1a1a', wrap=tk.WORD)
+        scrollbar = tk.Scrollbar(ai_frame, command=self.recommendation_text.yview)
+        self.recommendation_text.config(yscrollcommand=scrollbar.set)
+        self.recommendation_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.result_label = tk.Label(ai_frame, text="", font=('Microsoft YaHei', 14, 'bold'),
+                                    fg='#ffcc00', bg='#2d2d2d')
+        self.result_label.pack(fill=tk.X, side=tk.BOTTOM, pady=5)
+        
+        self.update_recommendation_display()
+        
+    def setup_table_panel(self, parent):
+        prob_frame = tk.Frame(parent, bg='#2d2d2d', height=150)
+        prob_frame.pack(fill=tk.X, pady=3)
+        prob_frame.pack_propagate(False)
+        
+        self.setup_probability_display(prob_frame)
+        
+        card_frame = tk.Frame(parent, bg='#1a1a1a')
+        card_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.setup_card_buttons(card_frame)
+        
+        bottom_frame = tk.Frame(parent, bg='#2d2d2d', height=60)
+        bottom_frame.pack(fill=tk.X, pady=3)
+        bottom_frame.pack_propagate(False)
+        
+        self.setup_bottom_controls(bottom_frame)
+        
+    def setup_probability_display(self, parent):
+        prob_grid = tk.Frame(parent, bg='#2d2d2d')
+        prob_grid.pack(expand=True, fill=tk.BOTH, padx=5, pady=5)
+        
+        prob_items = [
+            ('閒', 'player', '#ff6b6b'),
+            ('莊', 'banker', '#4ecdc4'), 
+            ('和', 'tie', '#45b7d1')
+        ]
+        
+        self.prob_labels = {}
+        
+        for i, (name, key, color) in enumerate(prob_items):
+            frame = tk.Frame(prob_grid, bg='#2d2d2d')
+            frame.grid(row=0, column=i, sticky='ew', pady=1, padx=5)
+            
+            prob_frame = tk.Frame(frame, bg='#3d3d3d', relief=tk.RAISED, bd=1, width=100, height=80)
+            prob_frame.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=1)
+            prob_frame.pack_propagate(False)
+            
+            title_label = tk.Label(prob_frame, text=name, font=('Microsoft YaHei', 9, 'bold'),
+                                  fg='white', bg=color, height=1)
+            title_label.pack(fill=tk.X)
+            
+            prob_label = tk.Label(prob_frame, text=f"{self.current_probs[key]:.3f}", 
+                                 font=('Microsoft YaHei', 10, 'bold'), fg='white', bg='#3d3d3d')
+            prob_label.pack(expand=True)
+            
+            self.prob_labels[key] = prob_label
+            
+    def setup_card_buttons(self, parent):
+        self.current_cards_label = tk.Label(parent, text="當前牌局：等待輸入...", 
+                                           font=('Microsoft YaHei', 12), fg='white', bg='#1a1a1a')
+        self.current_cards_label.pack(pady=5)
+        
+        row1_frame = tk.Frame(parent, bg='#1a1a1a')
+        row1_frame.pack(fill=tk.X, pady=2)
+        
+        cards_row1 = ['A', '2', '3', '4', '5']
+        for card in cards_row1:
+            btn = tk.Button(row1_frame, text=card, font=('Arial', 20, 'bold'),
+                           width=6, height=2, bg='#e74c3c', fg='white',
+                           command=lambda c=card: self.card_clicked(c))
+            btn.pack(side=tk.LEFT, padx=2)
+        
+        row2_frame = tk.Frame(parent, bg='#1a1a1a')
+        row2_frame.pack(fill=tk.X, pady=2)
+        
+        cards_row2 = ['6', '7', '8', '9', '10']
+        for card in cards_row2:
+            btn = tk.Button(row2_frame, text=card, font=('Arial', 20, 'bold'),
+                           width=6, height=2, bg='#3498db', fg='white',
+                           command=lambda c=card: self.card_clicked(c))
+            btn.pack(side=tk.LEFT, padx=2)
+        
+        row3_frame = tk.Frame(parent, bg='#1a1a1a')
+        row3_frame.pack(fill=tk.X, pady=2)
+        
+        cards_row3 = ['J', 'Q', 'K']
+        for card in cards_row3:
+            btn = tk.Button(row3_frame, text=card, font=('Arial', 20, 'bold'),
+                           width=6, height=2, bg='#9b59b6', fg='white',
+                           command=lambda c=card: self.card_clicked(c))
+            btn.pack(side=tk.LEFT, padx=2)
+            
+    def setup_bottom_controls(self, parent):
+        control_frame = tk.Frame(parent, bg='#2d2d2d')
+        control_frame.pack(expand=True)
+        
+        tk.Button(control_frame, text="完成本局", font=('Microsoft YaHei', 10),
+                 bg='#27ae60', fg='white', width=10, height=1,
+                 command=self.complete_round).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(control_frame, text="重新輸入", font=('Microsoft YaHei', 10),
+                 bg='#e67e22', fg='white', width=10, height=1,
+                 command=self.reset_input).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(control_frame, text="歷史分析", font=('Microsoft YaHei', 10),
+                 bg='#3498db', fg='white', width=10, height=1,
+                 command=self.show_history).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(control_frame, text="單局模擬", font=('Microsoft YaHei', 10),
+                 bg='#9b59b6', fg='white', width=10, height=1,
+                 command=self.auto_simulate).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(control_frame, text="重置系統", font=('Microsoft YaHei', 10),
+                 bg='#e74c3c', fg='white', width=10, height=1,
+                 command=self.reset_system).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(control_frame, text="導出CSV", font=('Microsoft YaHei', 10),
+                 bg='#f39c12', fg='white', width=10, height=1,
+                 command=self.export_to_csv).pack(side=tk.LEFT, padx=5)
+        
+        path_frame = tk.Frame(parent, bg='#2d2d2d', height=25)
+        path_frame.pack(fill=tk.X, pady=2)
+        path_frame.pack_propagate(False)
+        
+        self.path_label = tk.Label(path_frame, text=f"導出路徑: {self.export_path}", 
+                                  font=('Microsoft YaHei', 8), fg='#cccccc', bg='#2d2d2d')
+        self.path_label.pack(side=tk.LEFT, padx=10)
+        
+        tk.Button(path_frame, text="更改路徑", font=('Microsoft YaHei', 8),
+                 command=self.change_export_path, bg='#34495e', fg='white', width=8).pack(side=tk.RIGHT, padx=10)
+        
+    def change_export_path(self):
+        new_path = filedialog.askdirectory(title="選擇CSV導出目錄")
+        if new_path:
+            self.export_path = new_path
+            self.path_label.config(text=f"導出路徑: {self.export_path}")
+            messagebox.showinfo("成功", f"導出路徑已更改為: {self.export_path}")
+            
+    def card_clicked(self, card):
+        if len(self.current_cards) >= 6:
+            messagebox.showwarning("警告", "一局最多6張牌！")
+            return
+            
+        self.current_cards.append(card)
+        
+        if card in self.remaining_deck:
+            self.remaining_deck.remove(card)
+        
+        if card == 'A':
+            self.a_count += 1
+            
+        cards_text = f"當前牌局：{' '.join(self.current_cards)}"
+        self.current_cards_label.config(text=cards_text)
+        
+        self.update_probabilities_display_only()
+        
+    def toggle_trend_filter(self):
+        self.trend_filter_enabled = self.trend_filter_var.get()
+        status = "啟用" if self.trend_filter_enabled else "禁用"
+        self.data_status_label.config(text=f"v3.8.4趨勢優化系統{status} - 最小強度:{self.min_trend_strength}", fg='#00ff00')
+
+    def update_trend_settings(self):
+        try:
+            self.min_trend_strength = float(self.min_trend_var.get())
+            self.toggle_trend_filter()
+        except ValueError:
+            pass
+
+    def complete_round(self):
+        if len(self.current_cards) < 4:
+            messagebox.showwarning("警告", "至少需要4張牌才能完成一局！")
+            return
+        
+        current_changes = {}
+        for bet_type in ['banker', 'player', 'tie']:
+            current_prob = self.current_probs[bet_type]
+            base_prob = self.base_probabilities[bet_type]
+            current_changes[bet_type] = self.calculate_percentage_change(current_prob, base_prob)
+        
+        recommendation_snapshot = self.take_recommendation_snapshot()
+        
+        banker_hand, player_hand, banker_score, player_score = self.simulate_baccarat_round(self.current_cards)
+        
+        if banker_score > player_score:
+            winner = '莊'
+            winner_en = 'banker'
+        elif player_score > banker_score:
+            winner = '閒'
+            winner_en = 'player'
+        else:
+            winner = '和'
+            winner_en = 'tie'
+        
+        top_recommendation, bet_level, all_recommendations = self.get_top_recommendation()
+        recommendation_result = ""
+        is_reverse = False
+        
+        if top_recommendation and bet_level > 0:
+            self.consecutive_no_recommendation = 0
+            
+            # 檢查是否為反向推薦
+            for rec in all_recommendations:
+                if rec['bet_type'] == top_recommendation and rec.get('is_reverse', False):
+                    is_reverse = True
+                    break
+            
+            bet_amount = bet_level
+            self.recommendation_stats[top_recommendation]['bet'] += bet_amount
+            
+            if winner_en == 'tie':
+                if top_recommendation == 'tie':
+                    profit = bet_amount * 7
+                    self.recommendation_stats[top_recommendation]['win'] += bet_amount
+                    self.recommendation_stats[top_recommendation]['amount'] += profit
+                    reverse_indicator = "🔄" if is_reverse else ""
+                    recommendation_result = f"，推薦{reverse_indicator}({self.get_chinese_name(top_recommendation)})，{winner}贏 ✓"
+                else:
+                    self.recommendation_stats[top_recommendation]['amount'] += 0
+                    reverse_indicator = "🔄" if is_reverse else ""
+                    recommendation_result = f"，推薦{reverse_indicator}({self.get_chinese_name(top_recommendation)})，{winner}贏 ➖"
+            else:
+                if top_recommendation == winner_en:
+                    if top_recommendation == 'banker':
+                        profit = bet_amount * 0.95
+                    elif top_recommendation == 'player':
+                        profit = bet_amount * 1.0
+                    else:
+                        profit = bet_amount * 7
+                    
+                    self.recommendation_stats[top_recommendation]['win'] += bet_amount
+                    self.recommendation_stats[top_recommendation]['amount'] += profit
+                    reverse_indicator = "🔄" if is_reverse else ""
+                    recommendation_result = f"，推薦{reverse_indicator}({self.get_chinese_name(top_recommendation)})，{winner}贏 ✓"
+                else:
+                    self.recommendation_stats[top_recommendation]['amount'] -= bet_amount
+                    reverse_indicator = "🔄" if is_reverse else ""
+                    recommendation_result = f"，推薦{reverse_indicator}({self.get_chinese_name(top_recommendation)})，{winner}贏 ✗"
+        else:
+            recommendation_result = f"，無推薦，{winner}贏"
+        
+        round_data = {
+            'round': self.game_count,
+            'cards': self.current_cards.copy(),
+            'banker_hand': banker_hand,
+            'player_hand': player_hand,
+            'banker_score': banker_score,
+            'player_score': player_score,
+            'winner': winner_en,
+            'winner_chinese': winner,
+            'recommendation': top_recommendation,
+            'recommendation_chinese': self.get_chinese_name(top_recommendation) if top_recommendation else "無",
+            'bet_level': bet_level,
+            'is_reverse': is_reverse,
+            'recommendation_snapshot': recommendation_snapshot,
+            'all_recommendations': all_recommendations,
+            'recommendation_result': recommendation_result,
+            'probabilities': self.current_probs.copy(),
+            'changes': current_changes,
+            'trend_strengths': self.trend_strength.copy(),
+            'cumulative_changes': self.cumulative_changes.copy(),
+            'decay_counters': self.trend_decay_counter.copy(),
+            'consistency_version': 'v3.8.4'
+        }
+        
+        self.history.append(round_data)
+        
+        self.current_result = f"第{self.game_count}局: 閒{player_score} VS 莊{banker_score} - {winner}贏{recommendation_result}"
+        
+        self.previous_changes = current_changes
+        
+        self.game_count += 1
+        self.current_cards = []
+        
+        gpu_status = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+        self.status_label.config(text=f"局數：#{self.game_count} | A牌：{self.a_count} | 剩餘牌：{len(self.remaining_deck)} | 推薦範圍：{self.THRESHOLD_min_games}-{self.THRESHOLD_max_games}局{gpu_status}")
+        self.current_cards_label.config(text="當前牌局：等待輸入...")
+        
+        self.update_recommendation_display(recommendation_snapshot)
+
+    def get_chinese_name(self, bet_type):
+        chinese_names = {
+            'banker': '莊', 'player': '閒', 'tie': '和'
+        }
+        return chinese_names.get(bet_type, bet_type)
+    
+    def reset_input(self):
+        for card in self.current_cards:
+            self.remaining_deck.append(card)
+        
+        if self.current_cards and 'A' in self.current_cards:
+            self.a_count -= self.current_cards.count('A')
+            
+        self.current_cards = []
+        self.current_cards_label.config(text="當前牌局：等待輸入...")
+        self.update_probabilities_display_only()
+    
+    def reset_system(self):
+        result = messagebox.askyesno("確認", "確定要重置整個系統嗎？所有歷史數據將被清除。")
+        if result:
+            self.game_count = 1
+            self.a_count = 0
+            self.remaining_deck = self.initialize_deck(self.decks)
+            self.history = []
+            self.current_probs = self.base_probabilities.copy()
+            self.current_cards = []
+            self.current_result = ""
+            self.manual_threshold_set = False
+            self.auto_sim_results = []
+            self.gpu_simulation_history = []
+            self.gpu_detailed_results = []
+            
+            # 重置趨勢狀態（與GPU模擬器一致）
+            self.previous_changes = {'banker': 0.0, 'player': 0.0, 'tie': 0.0}
+            self.trend_strength = {'banker': 0.0, 'player': 0.0, 'tie': 0.0}
+            self.consecutive_no_recommendation = 0
+            self.cumulative_changes = {'banker': 0.0, 'player': 0.0, 'tie': 0.0}
+            self.change_history = {'banker': [], 'player': [], 'tie': []}
+            self.trend_decay_counter = {'banker': 0, 'player': 0, 'tie': 0}
+            
+            for key in self.recommendation_stats:
+                self.recommendation_stats[key] = {'bet': 0, 'win': 0, 'amount': 0}
+            
+            gpu_status = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+            self.status_label.config(text=f"局數：#{self.game_count} | A牌：{self.a_count} | 剩餘牌：{len(self.remaining_deck)} | 推薦範圍：{self.THRESHOLD_min_games}-{self.THRESHOLD_max_games}局{gpu_status}")
+            self.current_cards_label.config(text="當前牌局：等待輸入...")
+            self.data_status_label.config(text=f"v3.8.4趨勢優化系統 - 最小強度:{self.min_trend_strength}", fg='#00ff00')
+            self.update_recommendation_display()
+            messagebox.showinfo("提示", "系統已重置 - v3.8.4趨勢優化系統")
+
+    def auto_simulate(self):
+        num_cards = random.randint(4, 6)
+        self.current_cards = []
+        
+        for _ in range(num_cards):
+            if self.remaining_deck:
+                card = random.choice(self.remaining_deck)
+                self.current_cards.append(card)
+                self.remaining_deck.remove(card)
+                
+                if card == 'A':
+                    self.a_count += 1
+        
+        cards_text = f"當前牌局：{' '.join(self.current_cards)}"
+        self.current_cards_label.config(text=cards_text)
+        self.update_probabilities_display_only()
+    
+    def start_auto_simulate(self):
+        if self.simulation_running:
+            return
+            
+        try:
+            num_games = int(self.auto_games_var.get())
+            if num_games <= 0:
+                messagebox.showerror("錯誤", "請輸入有效的局數")
+                return
+        except ValueError:
+            messagebox.showerror("錯誤", "請輸入有效的數字")
+            return
+        
+        self.simulation_running = True
+        self.simulation_stop_flag = False
+        self.auto_sim_results = []
+        
+        self.root.after(100, lambda: self.run_auto_simulation(num_games, 0))
+    
+    def stop_auto_simulate(self):
+        self.simulation_stop_flag = True
+    
+    def run_auto_simulation(self, total_games, completed_games):
+        if self.simulation_stop_flag or completed_games >= total_games:
+            self.simulation_running = False
+            self.show_simulation_results()
+            return
+        
+        self.auto_simulate()
+        self.complete_round()
+        
+        if self.history:
+            last_round = self.history[-1]
+            result = {
+                'round': last_round['round'],
+                'winner': last_round['winner_chinese'],
+                'recommendation': last_round['recommendation_chinese'],
+                'bet_level': last_round['bet_level'],
+                'is_reverse': last_round.get('is_reverse', False),
+                'result': "✓" if "✓" in last_round['recommendation_result'] else 
+                         "✗" if "✗" in last_round['recommendation_result'] else "➖",
+                'banker_prob': last_round['probabilities']['banker'],
+                'player_prob': last_round['probabilities']['player'],
+                'tie_prob': last_round['probabilities']['tie'],
+                'banker_change': self.calculate_percentage_change(
+                    last_round['probabilities']['banker'], self.base_probabilities['banker']),
+                'player_change': self.calculate_percentage_change(
+                    last_round['probabilities']['player'], self.base_probabilities['player']),
+                'tie_change': self.calculate_percentage_change(
+                    last_round['probabilities']['tie'], self.base_probabilities['tie'])
+            }
+            self.auto_sim_results.append(result)
+        
+        progress = f"CPU模擬進度: {completed_games+1}/{total_games}"
+        self.data_status_label.config(text=progress, fg='#ffcc00')
+        
+        self.root.after(100, lambda: self.run_auto_simulation(total_games, completed_games + 1))
+    
+    def show_simulation_results(self):
+        if not self.auto_sim_results:
+            return
+            
+        total_games = len(self.auto_sim_results)
+        recommended_games = sum(1 for r in self.auto_sim_results if r['bet_level'] > 0)
+        win_games = sum(1 for r in self.auto_sim_results if r['result'] == '✓')
+        reverse_games = sum(1 for r in self.auto_sim_results if r.get('is_reverse', False))
+        total_profit = sum(self.recommendation_stats[bet]['amount'] for bet in ['banker', 'player', 'tie'])
+        
+        result_text = f"自動模擬完成: {total_games}局\n"
+        result_text += f"推薦局數: {recommended_games}局 ({recommended_games/total_games*100:.1f}%)\n"
+        result_text += f"反向推薦: {reverse_games}局 ({reverse_games/total_games*100:.1f}%)\n"
+        if recommended_games > 0:
+            result_text += f"推薦勝率: {win_games}/{recommended_games} ({win_games/recommended_games*100:.1f}%)\n"
+        result_text += f"總盈利: {total_profit:.2f}\n\n"
+        
+        result_text += "最近5局結果:\n"
+        for result in self.auto_sim_results[-5:]:
+            result_text += f"第{result['round']}局: {result['winner']}贏, "
+            if result['bet_level'] > 0:
+                reverse_indicator = "🔄" if result.get('is_reverse', False) else ""
+                result_text += f"推薦{reverse_indicator}{result['recommendation']}({result['bet_level']}注) {result['result']}\n"
+            else:
+                result_text += "無推薦\n"
+        
+        messagebox.showinfo("自動模擬結果 v3.8.4", result_text)
+    
+    def export_to_csv(self):
+        if not self.history:
+            messagebox.showinfo("提示", "沒有歷史數據可導出")
+            return
+        
+        filename = f"baccarat_simulation_v3.8.4_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        full_path = os.path.join(self.export_path, filename)
+        
+        os.makedirs(self.export_path, exist_ok=True)
+        
+        try:
+            with open(full_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                fieldnames = [
+                    '局數', '類型', '贏家', '莊概率', '閒概率', '和概率', 
+                    '莊變化%', '閒變化%', '和變化%', '推薦', '下注等級', '是否反向', '結果', '時間戳', '版本'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for round_data in self.history:
+                    banker_change = self.calculate_percentage_change(
+                        round_data['probabilities']['banker'], self.base_probabilities['banker'])
+                    player_change = self.calculate_percentage_change(
+                        round_data['probabilities']['player'], self.base_probabilities['player'])
+                    tie_change = self.calculate_percentage_change(
+                        round_data['probabilities']['tie'], self.base_probabilities['tie'])
+                    
+                    record_type = "正常對局"
+                    if round_data.get('type') == 'gpu_simulated':
+                        record_type = "GPU模擬"
+                    
+                    if "✓" in round_data.get('recommendation_result', ''):
+                        result = "贏"
+                    elif "✗" in round_data.get('recommendation_result', ''):
+                        result = "輸"
+                    else:
+                        result = "平"
+                    
+                    writer.writerow({
+                        '局數': round_data['round'],
+                        '類型': record_type,
+                        '贏家': round_data['winner_chinese'],
+                        '莊概率': round_data['probabilities']['banker'],
+                        '閒概率': round_data['probabilities']['player'],
+                        '和概率': round_data['probabilities']['tie'],
+                        '莊變化%': banker_change,
+                        '閒變化%': player_change,
+                        '和變化%': tie_change,
+                        '推薦': round_data['recommendation_chinese'],
+                        '下注等級': round_data['bet_level'],
+                        '是否反向': '是' if round_data.get('is_reverse', False) else '否',
+                        '結果': result,
+                        '時間戳': round_data.get('timestamp', 'N/A'),
+                        '版本': round_data.get('consistency_version', 'v3.8.4')
+                    })
+            
+            if self.gpu_simulation_history:
+                gpu_filename = f"gpu_simulation_history_v3.8.4_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                gpu_full_path = os.path.join(self.export_path, gpu_filename)
+                
+                with open(gpu_full_path, 'w', newline='', encoding='utf-8-sig') as gpu_file:
+                    gpu_fieldnames = [
+                        '模擬ID', '時間戳', '模擬局數', '用時(秒)', '速度(局/秒)',
+                        '莊勝', '閒勝', '和局', '莊勝率%', '閒勝率%', '和局率%', '反向推薦%', '版本'
+                    ]
+                    gpu_writer = csv.DictWriter(gpu_file, fieldnames=gpu_fieldnames)
+                    gpu_writer.writeheader()
+                    
+                    for i, sim in enumerate(self.gpu_simulation_history):
+                        results = sim['results']
+                        performance = sim.get('performance', {})
+                        
+                        # 計算本次模擬的反向推薦比例
+                        reverse_count = 0
+                        total_recommendations = 0
+                        for result in sim.get('detailed_results', []):
+                            if result.get('recommendation'):
+                                total_recommendations += 1
+                                if result.get('is_reverse', False):
+                                    reverse_count += 1
+                        
+                        reverse_rate = (reverse_count / total_recommendations * 100) if total_recommendations > 0 else 0
+                        
+                        gpu_writer.writerow({
+                            '模擬ID': i + 1,
+                            '時間戳': sim['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                            '模擬局數': sim['num_simulations'],
+                            '用時(秒)': f"{performance.get('total_time', 0):.2f}",
+                            '速度(局/秒)': f"{performance.get('games_per_second', 0):.0f}",
+                            '莊勝': results['banker_wins'],
+                            '閒勝': results['player_wins'],
+                            '和局': results['ties'],
+                            '莊勝率%': f"{results['banker_win_rate']:.2f}",
+                            '閒勝率%': f"{results['player_win_rate']:.2f}",
+                            '和局率%': f"{results['tie_rate']:.2f}",
+                            '反向推薦%': f"{reverse_rate:.1f}",
+                            '版本': 'v3.8.4趨勢優化系統'
+                        })
+                
+                messagebox.showinfo("成功", f"數據已導出到:\n{full_path}\nGPU模擬歷史: {gpu_full_path}")
+            else:
+                messagebox.showinfo("成功", f"數據已導出到: {full_path}")
+            
+        except Exception as e:
+            messagebox.showerror("錯誤", f"導出失敗: {str(e)}")
+    
+    def show_history(self):
+        if not self.history and not self.gpu_simulation_history:
+            messagebox.showinfo("歷史分析", "尚未有歷史記錄")
+            return
+        
+        history_window = tk.Toplevel(self.root)
+        history_window.title("歷史分析報告 v3.8.4（趨勢優化系統）")
+        history_window.geometry("1000x700")
+        history_window.configure(bg='#2d2d2d')
+        
+        notebook = ttk.Notebook(history_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        text_frame = ttk.Frame(notebook)
+        notebook.add(text_frame, text="文字報告")
+        
+        text_area = tk.Text(text_frame, font=('Microsoft YaHei', 9), 
+                           fg='white', bg='#1a1a1a', wrap=tk.WORD)
+        scrollbar = tk.Scrollbar(text_frame, command=text_area.yview)
+        text_area.config(yscrollcommand=scrollbar.set)
+        
+        text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        report = self.generate_history_report()
+        text_area.insert(tk.END, report)
+        text_area.config(state=tk.DISABLED)
+        
+        if self.gpu_simulation_history:
+            gpu_frame = ttk.Frame(notebook)
+            notebook.add(gpu_frame, text="GPU模擬歷史")
+            
+            gpu_text = tk.Text(gpu_frame, font=('Microsoft YaHei', 9), 
+                             fg='white', bg='#1a1a1a', wrap=tk.WORD)
+            gpu_scrollbar = tk.Scrollbar(gpu_frame, command=gpu_text.yview)
+            gpu_text.config(yscrollcommand=gpu_scrollbar.set)
+            
+            gpu_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            gpu_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            gpu_report = self.generate_gpu_history_report()
+            gpu_text.insert(tk.END, gpu_report)
+            gpu_text.config(state=tk.DISABLED)
+        
+        if MATPLOTLIB_AVAILABLE and len(self.history) > 1:
+            chart_frame = ttk.Frame(notebook)
+            notebook.add(chart_frame, text="趨勢圖")
+            self.create_trend_chart(chart_frame)
+        else:
+            no_chart_frame = ttk.Frame(notebook)
+            notebook.add(no_chart_frame, text="趨勢圖")
+            
+            label = tk.Label(no_chart_frame, text="圖表功能不可用或數據不足", 
+                           font=('Microsoft YaHei', 12), bg='#2d2d2d', fg='white')
+            label.pack(expand=True)
+
+    def generate_history_report(self):
+        """生成歷史分析報告"""
+        report = "=== 百家樂歷史分析報告 v3.8.4（趨勢優化系統） ===\n\n"
+        report += f"總局數: {len(self.history)}\n"
+        report += f"A牌出現次數: {self.a_count}\n"
+        report += f"剩餘牌數: {len(self.remaining_deck)}\n"
+        report += f"推薦範圍: 第{self.THRESHOLD_min_games}~{self.THRESHOLD_max_games}局\n"
+        report += f"導出路徑: {self.export_path}\n"
+        report += f"GPU加速: {'可用' if self.gpu_enabled else '不可用'}\n"
+        report += f"GPU模擬次數: {len(self.gpu_simulation_history)}\n"
+        report += f"趨勢過濾: {'啟用' if self.trend_filter_enabled else '禁用'}\n"
+        report += f"最小趨勢強度: {self.min_trend_strength}\n"
+        report += f"最大趨勢強度: {self.max_trend_strength}\n"
+        report += f"下注策略: v3.8.4趨勢優化系統（推薦率大幅提升）\n\n"
+        
+        normal_games = [h for h in self.history if h.get('type') != 'gpu_simulated']
+        gpu_games = [h for h in self.history if h.get('type') == 'gpu_simulated']
+        
+        if normal_games:
+            banker_wins = sum(1 for h in normal_games if h['winner'] == 'banker')
+            player_wins = sum(1 for h in normal_games if h['winner'] == 'player')
+            tie_wins = sum(1 for h in normal_games if h['winner'] == 'tie')
+            
+            report += f"正常對局: {len(normal_games)}局\n"
+            report += f"莊家勝: {banker_wins}局 ({banker_wins/len(normal_games)*100:.1f}%)\n"
+            report += f"閒家勝: {player_wins}局 ({player_wins/len(normal_games)*100:.1f}%)\n"
+            report += f"和局: {tie_wins}局 ({tie_wins/len(normal_games)*100:.1f}%)\n\n"
+        
+        if gpu_games:
+            banker_wins = sum(1 for h in gpu_games if h['winner'] == 'banker')
+            player_wins = sum(1 for h in gpu_games if h['winner'] == 'player')
+            tie_wins = sum(1 for h in gpu_games if h['winner'] == 'tie')
+            
+            report += f"GPU模擬: {len(gpu_games)}局\n"
+            report += f"莊家勝: {banker_wins}局 ({banker_wins/len(gpu_games)*100:.1f}%)\n"
+            report += f"閒家勝: {player_wins}局 ({player_wins/len(gpu_games)*100:.1f}%)\n"
+            report += f"和局: {tie_wins}局 ({tie_wins/len(gpu_games)*100:.1f}%)\n\n"
+        
+        # 推薦項目統計
+        report += "=== 推薦項目統計 ===\n"
+        chinese_names = {
+            'banker': '莊', 'player': '閒', 'tie': '和'
+        }
+        
+        total_bet = 0
+        total_win = 0
+        total_amount = 0
+        reverse_bet = 0
+        
+        # 合併所有歷史記錄的推薦統計
+        all_stats = {
+            'banker': {'bet': 0, 'win': 0, 'amount': 0, 'reverse': 0},
+            'player': {'bet': 0, 'win': 0, 'amount': 0, 'reverse': 0},
+            'tie': {'bet': 0, 'win': 0, 'amount': 0, 'reverse': 0}
+        }
+        
+        # 計算所有歷史記錄的推薦統計
+        for record in self.history:
+            if record.get('recommendation') and record.get('bet_level', 0) > 0:
+                bet_type = record['recommendation']
+                bet_level = record['bet_level']
+                is_reverse = record.get('is_reverse', False)
+                
+                all_stats[bet_type]['bet'] += bet_level
+                if is_reverse:
+                    all_stats[bet_type]['reverse'] += bet_level
+                    reverse_bet += bet_level
+                
+                if "✓" in record.get('recommendation_result', ''):
+                    all_stats[bet_type]['win'] += bet_level
+                    if bet_type == 'banker':
+                        all_stats[bet_type]['amount'] += bet_level * 0.95
+                    elif bet_type == 'player':
+                        all_stats[bet_type]['amount'] += bet_level * 1.0
+                    else:
+                        all_stats[bet_type]['amount'] += bet_level * 7.0
+                elif "✗" in record.get('recommendation_result', ''):
+                    all_stats[bet_type]['amount'] -= bet_level
+        
+        for bet_type, stats in all_stats.items():
+            if stats['bet'] > 0:
+                win_rate = stats['win'] / stats['bet'] * 100 if stats['bet'] > 0 else 0
+                reverse_rate = stats['reverse'] / stats['bet'] * 100 if stats['bet'] > 0 else 0
+                chinese_name = chinese_names.get(bet_type, bet_type)
+                report += f"推薦{chinese_name}: {stats['win']}/{stats['bet']} ({win_rate:.1f}%)，反向: {reverse_rate:.1f}%，淨利: {stats['amount']:.2f}\n"
+                total_bet += stats['bet']
+                total_win += stats['win']
+                total_amount += stats['amount']
+        
+        if total_bet > 0:
+            overall_win_rate = total_win / total_bet * 100
+            overall_reverse_rate = reverse_bet / total_bet * 100
+            report += f"\n總計: {total_win}/{total_bet} ({overall_win_rate:.1f}%)，總淨利: {total_amount:.2f}\n"
+            report += f"反向推薦比例: {overall_reverse_rate:.1f}%\n"
+        else:
+            report += "尚無推薦下注記錄"
+        
+        report += "\n"
+        
+        report += "最近10局記錄:\n"
+        report += "-" * 70 + "\n"
+        
+        recent_games = self.history[-10:]
+        for i, round_data in enumerate(recent_games, 1):
+            game_type = "GPU" if round_data.get('type') == 'gpu_simulated' else "正常"
+            report += f"第{round_data['round']}局({game_type}): "
+            
+            if 'player_score' in round_data and 'banker_score' in round_data:
+                report += f"閒{round_data['player_score']} VS 莊{round_data['banker_score']} - "
+            else:
+                report += f"{round_data['winner_chinese']}贏 - "
+            
+            if round_data['recommendation']:
+                if "✓" in round_data['recommendation_result']:
+                    win_symbol = "✓"
+                elif "✗" in round_data['recommendation_result']:
+                    win_symbol = "✗"
+                else:
+                    win_symbol = "➖"
+                    
+                reverse_indicator = "🔄" if round_data.get('is_reverse', False) else ""
+                report += f"推薦{reverse_indicator}({round_data['recommendation_chinese']})，{round_data['winner_chinese']}贏 {win_symbol}\n"
+            else:
+                report += f"無推薦，{round_data['winner_chinese']}贏\n"
+        
+        return report
+
+    def generate_gpu_history_report(self):
+        report = "=== GPU模擬歷史報告 v3.8.4 ===\n\n"
+        
+        if not self.gpu_simulation_history:
+            report += "尚無GPU模擬記錄\n"
+            return report
+        
+        total_simulations = sum(sim['num_simulations'] for sim in self.gpu_simulation_history)
+        total_time = sum(sim.get('performance', {}).get('total_time', 0) for sim in self.gpu_simulation_history)
+        avg_speed = total_simulations / total_time if total_time > 0 else 0
+        
+        # 計算總反向推薦比例
+        total_reverse_count = 0
+        total_recommendations = 0
+        for sim in self.gpu_simulation_history:
+            for result in sim.get('detailed_results', []):
+                if result.get('recommendation'):
+                    total_recommendations += 1
+                    if result.get('is_reverse', False):
+                        total_reverse_count += 1
+        
+        overall_reverse_rate = (total_reverse_count / total_recommendations * 100) if total_recommendations > 0 else 0
+        
+        report += f"總模擬次數: {len(self.gpu_simulation_history)}次\n"
+        report += f"總模擬局數: {total_simulations:,}局\n"
+        report += f"總模擬時間: {total_time:.2f}秒\n"
+        report += f"平均速度: {avg_speed:.0f}局/秒\n"
+        report += f"總推薦次數: {total_recommendations}次\n"
+        report += f"總反向推薦: {total_reverse_count}次 ({overall_reverse_rate:.1f}%)\n"
+        report += f"系統版本: v3.8.4趨勢優化系統\n\n"
+        
+        report += "詳細模擬記錄:\n"
+        report += "=" * 80 + "\n"
+        
+        for i, sim in enumerate(self.gpu_simulation_history, 1):
+            results = sim['results']
+            performance = sim.get('performance', {})
+            
+            # 計算本次模擬的反向推薦比例
+            reverse_count = 0
+            total_recs = 0
+            for result in sim.get('detailed_results', []):
+                if result.get('recommendation'):
+                    total_recs += 1
+                    if result.get('is_reverse', False):
+                        reverse_count += 1
+            
+            reverse_rate = (reverse_count / total_recs * 100) if total_recs > 0 else 0
+            
+            report += f"模擬 #{i}:\n"
+            report += f"  時間: {sim['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+            report += f"  局數: {sim['num_simulations']:,}局\n"
+            report += f"  用時: {performance.get('total_time', 0):.2f}秒\n"
+            report += f"  速度: {performance.get('games_per_second', 0):.0f}局/秒\n"
+            report += f"  結果: 莊{results['banker_wins']}局({results['banker_win_rate']:.2f}%) | "
+            report += f"閒{results['player_wins']}局({results['player_win_rate']:.2f}%) | "
+            report += f"和{results['ties']}局({results['tie_rate']:.2f}%)\n"
+            report += f"  反向推薦: {reverse_count}/{total_recs} ({reverse_rate:.1f}%)\n"
+            report += "-" * 80 + "\n"
+        
+        return report
+
+    def create_trend_chart(self, parent):
+        """創建趨勢圖表"""
+        if not MATPLOTLIB_AVAILABLE or len(self.history) < 2:
+            label = tk.Label(parent, text="數據不足或圖表功能不可用", 
+                           font=('Microsoft YaHei', 12), bg='#2d2d2d', fg='white')
+            label.pack(expand=True)
+            return
+        
+        # 包含所有歷史數據（正常對局和GPU模擬）
+        all_games = [h for h in self.history if 'probabilities' in h]
+        if len(all_games) < 2:
+            label = tk.Label(parent, text="數據不足", 
+                           font=('Microsoft YaHei', 12), bg='#2d2d2d', fg='white')
+            label.pack(expand=True)
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        fig.patch.set_facecolor('#2d2d2d')
+        
+        # 概率趨勢圖
+        rounds = [h['round'] for h in all_games]
+        banker_probs = [h['probabilities']['banker'] for h in all_games]
+        player_probs = [h['probabilities']['player'] for h in all_games]
+        tie_probs = [h['probabilities']['tie'] for h in all_games]
+        
+        # 使用不同顏色標記GPU模擬數據點
+        gpu_indices = [i for i, h in enumerate(all_games) if h.get('type') == 'gpu_simulated']
+        normal_indices = [i for i, h in enumerate(all_games) if h.get('type') != 'gpu_simulated']
+        
+        # 標記反向推薦點
+        reverse_indices = [i for i, h in enumerate(all_games) if h.get('is_reverse', False)]
+        
+        # 繪製正常對局線條
+        ax1.plot(rounds, banker_probs, label='莊家概率', color='#4ecdc4', linewidth=2, alpha=0.7)
+        ax1.plot(rounds, player_probs, label='閒家概率', color='#ff6b6b', linewidth=2, alpha=0.7)
+        ax1.plot(rounds, tie_probs, label='和局概率', color='#45b7d1', linewidth=2, alpha=0.7)
+        
+        # 標記GPU模擬數據點
+        if gpu_indices:
+            gpu_rounds = [rounds[i] for i in gpu_indices]
+            gpu_banker = [banker_probs[i] for i in gpu_indices]
+            gpu_player = [player_probs[i] for i in gpu_indices]
+            gpu_tie = [tie_probs[i] for i in gpu_indices]
+            
+            ax1.scatter(gpu_rounds, gpu_banker, color='#4ecdc4', s=30, alpha=0.8, marker='o', label='GPU-莊')
+            ax1.scatter(gpu_rounds, gpu_player, color='#ff6b6b', s=30, alpha=0.8, marker='s', label='GPU-閒')
+            ax1.scatter(gpu_rounds, gpu_tie, color='#45b7d1', s=30, alpha=0.8, marker='^', label='GPU-和')
+        
+        # 標記反向推薦點
+        if reverse_indices:
+            reverse_rounds = [rounds[i] for i in reverse_indices]
+            reverse_probs = [banker_probs[i] for i in reverse_indices]  # 使用莊家概率作為y坐標
+            ax1.scatter(reverse_rounds, reverse_probs, color='#ff00ff', s=100, alpha=0.8, marker='*', label='反向推薦')
+        
+        ax1.axhline(y=self.base_probabilities['banker'], color='#4ecdc4', linestyle='--', alpha=0.5)
+        ax1.axhline(y=self.base_probabilities['player'], color='#ff6b6b', linestyle='--', alpha=0.5)
+        ax1.axhline(y=self.base_probabilities['tie'], color='#45b7d1', linestyle='--', alpha=0.5)
+        
+        ax1.set_title('概率趨勢圖 v3.8.4（趨勢優化系統）', color='white', fontsize=14)
+        ax1.set_xlabel('局數', color='white')
+        ax1.set_ylabel('概率 (%)', color='white')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.set_facecolor('#1a1a1a')
+        ax1.tick_params(colors='white')
+        
+        # 盈利趨勢圖
+        cumulative_profit = []
+        current_profit = 0
+        
+        for h in all_games:
+            if 'recommendation' in h and h['recommendation'] and 'bet_level' in h:
+                bet_type = h['recommendation']
+                bet_level = h['bet_level']
+                
+                if "✓" in h.get('recommendation_result', ''):
+                    if bet_type == 'banker':
+                        current_profit += bet_level * 0.95
+                    elif bet_type == 'player':
+                        current_profit += bet_level * 1.0
+                    else:
+                        current_profit += bet_level * 7
+                elif "✗" in h.get('recommendation_result', ''):
+                    current_profit -= bet_level
+            cumulative_profit.append(current_profit)
+        
+        ax2.plot(rounds, cumulative_profit, label='累計盈利', color='#2ecc71', linewidth=2)
+        
+        # 標記GPU模擬的盈利點
+        if gpu_indices:
+            gpu_profits = [cumulative_profit[i] for i in gpu_indices]
+            ax2.scatter(gpu_rounds, gpu_profits, color='#2ecc71', s=50, alpha=0.8, marker='*', label='GPU模擬點')
+        
+        # 標記反向推薦的盈利點
+        if reverse_indices:
+            reverse_profits = [cumulative_profit[i] for i in reverse_indices]
+            ax2.scatter(reverse_rounds, reverse_profits, color='#ff00ff', s=100, alpha=0.8, marker='*', label='反向推薦點')
+        
+        ax2.axhline(y=0, color='white', linestyle='-', alpha=0.5)
+        
+        ax2.set_title('盈利趨勢圖 v3.8.4（趨勢優化系統）', color='white', fontsize=14)
+        ax2.set_xlabel('局數', color='white')
+        ax2.set_ylabel('盈利', color='white')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_facecolor('#1a1a1a')
+        ax2.tick_params(colors='white')
+        
+        plt.tight_layout()
+        
+        canvas = FigureCanvasTkAgg(fig, parent)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def update_recommendation_display(self, snapshot=None):
+        if len(self.current_cards) > 0:
+            self.calculate_remaining_probabilities()
+        
+        recommendations = []
+        
+        if snapshot:
+            for bet_type in ['banker', 'player']:
+                if snapshot.get(bet_type):
+                    recommendations.append(snapshot[bet_type])
+        else:
+            for bet_type in ['banker', 'player']:
+                recommendation = self.get_recommendation_text(bet_type)
+                if recommendation:
+                    recommendations.append(recommendation)
+        
+        recommendations.sort(key=lambda x: x['level'], reverse=True)
+        
+        self.recommendation_text.config(state=tk.NORMAL)
+        self.recommendation_text.delete(1.0, tk.END)
+        
+        gpu_info = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+        range_info = f"推薦範圍: 第{self.THRESHOLD_min_games}~{self.THRESHOLD_max_games}局 | 當前局數: {self.game_count}局{gpu_info}\n"
+        range_info += f"當前策略: 莊閒專用 | 牌副數: {self.decks}副\n"
+        range_info += f"趨勢過濾: {'啟用' if self.trend_filter_enabled else '禁用'} | 最小強度: {self.min_trend_strength}\n"
+        range_info += f"最大趨勢強度: {self.max_trend_strength} | 動態衰減: 啟用\n"
+        range_info += f"下注策略: v3.8.4趨勢優化系統（推薦率大幅提升）\n"
+        range_info += f"系統特點: 趨勢加速 + 低閾值 + 動態衰減 + 精準反向\n"
+        if self.gpu_simulation_history:
+            range_info += f"GPU模擬次數: {len(self.gpu_simulation_history)}次\n"
+        range_info += "="*40 + "\n\n"
+        
+        self.recommendation_text.insert(tk.END, range_info)
+        
+        if recommendations:
+            for rec in recommendations:
+                start_index = self.recommendation_text.index(tk.END)
+                self.recommendation_text.insert(tk.END, rec['text'])
+                
+                if rec['level'] >= 10:
+                    color = '#ff0000'
+                elif rec['level'] >= 5:
+                    color = '#ff4444'
+                elif rec['level'] >= 3:
+                    color = '#ffaa00'
+                elif rec['level'] >= 1:
+                    color = '#ffff00'
+                else:
+                    color = '#cccccc'
+                    
+                end_index = self.recommendation_text.index(tk.END)
+                self.recommendation_text.tag_add(f"color_{rec['bet_type']}", start_index, end_index)
+                self.recommendation_text.tag_config(f"color_{rec['bet_type']}", foreground=color)
+        else:
+            self.recommendation_text.insert(tk.END, "請輸入牌局數據...\n\n")
+            self.recommendation_text.insert(tk.END, f"當前概率: 莊{self.current_probs['banker']:.3f} 閒{self.current_probs['player']:.3f} 和{self.current_probs['tie']:.3f}")
+        
+        if self.current_result:
+            self.recommendation_text.insert(tk.END, f"\n\n{self.current_result}")
+        
+        self.recommendation_text.config(state=tk.DISABLED)
+        
+        self.result_label.config(text=self.current_result)
+    
+    def update_thresholds(self):
+        try:
+            self.THRESHOLD_min_games = int(self.min_games_var.get())
+            self.THRESHOLD_max_games = int(self.max_games_var.get())
+            
+            if self.THRESHOLD_min_games >= self.THRESHOLD_max_games:
+                self.THRESHOLD_max_games = self.THRESHOLD_min_games + 10
+                self.max_games_var.set(str(self.THRESHOLD_max_games))
+                
+            gpu_status = " | GPU加速: 可用" if self.gpu_enabled else " | GPU加速: 不可用"
+            self.status_label.config(text=f"局數：#{self.game_count} | A牌：{self.a_count} | 剩餘牌：{len(self.remaining_deck)} | 推薦範圍：{self.THRESHOLD_min_games}-{self.THRESHOLD_max_games}局{gpu_status}")
+            self.update_recommendation_display()
+            
+        except ValueError:
+            pass
+    
+    def set_strategy(self, strategy_type):
+        self.observe_bp = True
+        self.observe_tie = False
+        strategy_text = f"當前: 莊閒專用策略 | v3.8.4趨勢優化系統"
+        if self.gpu_enabled:
+            strategy_text += " | GPU加速"
+        self.strategy_label.config(text=strategy_text)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BaccaratAIAssistant(root)
+    root.mainloop()
